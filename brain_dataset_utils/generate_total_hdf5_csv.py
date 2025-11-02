@@ -151,6 +151,62 @@ def create_hdf5_dataset(args):
     print(CT_dataset.shape)
     print(len(subjects))
 
+def create_folder_hdf5(data_dir, hdf5_name = "output.hdf5", CT_name="CT.nii", MR_name="MR.nii", plane="axial", threshold=50, height=128, width=128, debugging=False):
+    start_d = time.time()
+    subjects = sorted([os.path.join(data_dir, d) for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+    print(f"Found {len(subjects)} subject folders in {data_dir}")
+
+    CT_dataset = np.ndarray(shape=(height, width, 0), dtype=np.float32)
+    MR_dataset = np.ndarray(shape=(height, width, 0), dtype=np.float32)
+    index_dataset = np.ndarray(shape=(0), dtype=np.uint8)
+    max_index_dataset = np.ndarray(shape=(0), dtype=np.uint8)
+    subjects = []
+
+    for idx, current_subject in enumerate(subjects):
+        start = time.time()
+
+        subject = os.path.basename(current_subject)
+        CT_path = os.path.join(current_subject, CT_name)
+        MR_path = os.path.join(current_subject, MR_name)
+
+        if not (os.path.isfile(CT_path) and os.path.isfile(MR_path)):
+            print(f"{subject} is missing CT or MR file.")
+            continue
+
+        CT_data = np.nan_to_num(np.asanyarray(nib.load(CT_path).dataobj))
+        MR_data = np.nan_to_num(np.asanyarray(nib.load(MR_path).dataobj))
+
+        CT_data = transpose_LPS_to_ITKSNAP_position(CT_data, args.plane)
+        MR_data = transpose_LPS_to_ITKSNAP_position(MR_data, args.plane)
+
+        CT_data, MR_data = filter_blank_slices_thick(CT_data, MR_data, threshold=50)
+
+        CT_dataset = np.append(CT_dataset, CT_data, axis=2)
+        MR_dataset = np.append(MR_dataset, MR_data, axis=2)
+        index_dataset = np.append(index_dataset, np.arange(CT_data.shape[2], dtype=np.uint8), axis=0)
+        max_index_dataset = np.append(max_index_dataset, np.full(CT_data.shape[2], CT_data.shape[2]-1, dtype=np.uint8), axis=0)
+        subjects.extend([subject.encode("ascii", "ignore")] * CT_data.shape[2])
+
+        end = time.time() - start
+        print("Volume: {} Finished Data Reading and Appending in {:.3f} seconds.".format(idx, end))
+        if args.debugging and idx == 2:
+            break
+
+    index_dataset = np.transpose(np.vstack((index_dataset, max_index_dataset))).astype(np.uint8)
+
+    with h5py.File(hdf5_name, "w") as hf:
+        hf.create_dataset("CT_dataset", data=CT_dataset, compression="gzip")
+        hf.create_dataset("MR_dataset", data=MR_dataset, compression="gzip")
+        hf.create_dataset("index_dataset", data=index_dataset, compression="gzip")
+
+        dt = h5py.special_dtype(vlen=str)
+        hf.create_dataset("subject", data=subjects, dtype=dt, compression="gzip")
+    
+    end_d = time.time() - start_d
+    print("Successfully written {} in {:.3f} seconds.".format(args.hdf5_name, end_d))
+    print(index_dataset.shape)
+    print(CT_data.shape)
+    print(len(subjects))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='HDF5-Creation')

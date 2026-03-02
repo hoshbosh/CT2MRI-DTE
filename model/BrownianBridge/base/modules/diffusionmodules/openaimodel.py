@@ -349,7 +349,8 @@ def count_flops_attn(model, _x, y):
 
 class QKVAttentionLegacy(nn.Module):
     """
-    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
+    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping.
+    Uses F.scaled_dot_product_attention for FlashAttention acceleration when available.
     """
 
     def __init__(self, n_heads):
@@ -366,12 +367,12 @@ class QKVAttentionLegacy(nn.Module):
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v)
+        # q, k, v: [bs*n_heads, ch, length] -> need [bs*n_heads, length, ch] for SDPA
+        q = q.permute(0, 2, 1)  # [B*H, T, C]
+        k = k.permute(0, 2, 1)
+        v = v.permute(0, 2, 1)
+        a = F.scaled_dot_product_attention(q, k, v)  # FlashAttention when available
+        a = a.permute(0, 2, 1)  # back to [B*H, C, T]
         return a.reshape(bs, -1, length)
 
     @staticmethod
@@ -382,6 +383,7 @@ class QKVAttentionLegacy(nn.Module):
 class QKVAttention(nn.Module):
     """
     A module which performs QKV attention and splits in a different order.
+    Uses F.scaled_dot_product_attention for FlashAttention acceleration when available.
     """
 
     def __init__(self, n_heads):
@@ -398,14 +400,12 @@ class QKVAttention(nn.Module):
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.chunk(3, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts",
-            (q * scale).view(bs * self.n_heads, ch, length),
-            (k * scale).view(bs * self.n_heads, ch, length),
-        )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        # reshape to [bs*n_heads, ch, length] then transpose for SDPA
+        q = q.view(bs * self.n_heads, ch, length).permute(0, 2, 1)  # [B*H, T, C]
+        k = k.view(bs * self.n_heads, ch, length).permute(0, 2, 1)
+        v = v.view(bs * self.n_heads, ch, length).permute(0, 2, 1)
+        a = F.scaled_dot_product_attention(q, k, v)  # FlashAttention when available
+        a = a.permute(0, 2, 1)  # back to [B*H, C, T]
         return a.reshape(bs, -1, length)
 
     @staticmethod
@@ -978,4 +978,3 @@ class EncoderUNetModel(nn.Module):
         else:
             h = h.type(x.dtype)
             return self.out(h)
-

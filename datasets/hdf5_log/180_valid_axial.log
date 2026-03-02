@@ -1,0 +1,38 @@
+Namespace(hdf5_name='/blue/neurology-dept/jlabasbas/hdf5s/180_valid_axial.hdf5', plane='axial', which_set='valid', debugging=False, data_csv='/blue/neurology-dept/jlabasbas/out/data.csv', pattern='*', height=180, width=180, data_dir='/blue/neurology-dept/jlabasbas/out', CT_name='ct.nii', MR_name='mr.nii')
+data size: 8
+Volume Nr: 0 Processing Data from /blue/neurology-dept/jlabasbas/out/IXI013-HH-1212-T1/ct.nii
+(180, 180, 133)
+4 ~ 136
+Volume: 0 Finished Data Reading and Appending in 0.294 seconds.
+Volume Nr: 1 Processing Data from /blue/neurology-dept/jlabasbas/out/IXI014-HH-1236-T1/ct.nii
+(180, 180, 132)
+4 ~ 135
+Volume: 1 Finished Data Reading and Appending in 0.342 seconds.
+Volume Nr: 2 Processing Data from /blue/neurology-dept/jlabasbas/out/IXI056-HH-1327-T1/ct.nii
+(180, 180, 138)
+6 ~ 143
+Volume: 2 Finished Data Reading and Appending in 0.144 seconds.
+Volume Nr: 3 Processing Data from /blue/neurology-dept/jlabasbas/out/IXI128-HH-1470-T1/ct.nii
+(180, 180, 126)
+5 ~ 130
+Volume: 3 Finished Data Reading and Appending in 0.141 seconds.
+Volume Nr: 4 Processing Data from /blue/neurology-dept/jlabasbas/out/IXI148-HH-1453-T1/ct.nii
+(180, 180, 144)
+4 ~ 147
+Volume: 4 Finished Data Reading and Appending in 0.204 seconds.
+Volume Nr: 5 Processing Data from /blue/neurology-dept/jlabasbas/out/sub-0328_run-1_T1w/ct.nii
+(180, 180, 151)
+5 ~ 155
+Volume: 5 Finished Data Reading and Appending in 0.188 seconds.
+Volume Nr: 6 Processing Data from /blue/neurology-dept/jlabasbas/out/sub-0329_run-1_T1w/ct.nii
+(180, 180, 153)
+4 ~ 156
+Volume: 6 Finished Data Reading and Appending in 0.184 seconds.
+Volume Nr: 7 Processing Data from /blue/neurology-dept/jlabasbas/out/sub-0330_run-1_T1w/ct.nii
+(180, 180, 145)
+5 ~ 149
+Volume: 7 Finished Data Reading and Appending in 0.307 seconds.
+Successfully written /blue/neurology-dept/jlabasbas/hdf5s/180_valid_axial.hdf5 in 6.171 seconds.
+(1122, 2)
+(180, 180, 1122)
+1122

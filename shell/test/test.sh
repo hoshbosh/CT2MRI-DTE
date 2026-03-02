@@ -2,7 +2,7 @@
 cd /root_dir/code
 
 config_name="BBDM_base.yaml"
-HW="160"
+HW="180"
 plane="axial"
 ddim_eta=0.0
 

@@ -191,19 +191,20 @@ class BaseRunner(ABC):
     def validation_step(self, val_batch, epoch, step):
         self.apply_ema()
         self.net.eval()
-        loss = self.loss_fn(net=self.net,
-                            batch=val_batch,
-                            epoch=epoch,
-                            step=step,
-                            opt_idx=0,
-                            stage='val_step')
-        if len(self.optimizer) > 1:
+        with torch.cuda.amp.autocast():
             loss = self.loss_fn(net=self.net,
                                 batch=val_batch,
                                 epoch=epoch,
                                 step=step,
-                                opt_idx=1,
+                                opt_idx=0,
                                 stage='val_step')
+            if len(self.optimizer) > 1:
+                loss = self.loss_fn(net=self.net,
+                                    batch=val_batch,
+                                    epoch=epoch,
+                                    step=step,
+                                    opt_idx=1,
+                                    stage='val_step')
         self.restore_ema()
 
     @torch.no_grad()
@@ -216,23 +217,24 @@ class BaseRunner(ABC):
         loss_sum = 0.
         dloss_sum = 0.
         for val_batch in pbar:
-            loss = self.loss_fn(net=self.net,
-                                batch=val_batch,
-                                epoch=epoch,
-                                step=step,
-                                opt_idx=0,
-                                stage='val',
-                                write=False)
-            loss_sum += loss
-            if len(self.optimizer) > 1:
+            with torch.cuda.amp.autocast():
                 loss = self.loss_fn(net=self.net,
                                     batch=val_batch,
                                     epoch=epoch,
                                     step=step,
-                                    opt_idx=1,
+                                    opt_idx=0,
                                     stage='val',
                                     write=False)
-                dloss_sum += loss
+                loss_sum += loss
+                if len(self.optimizer) > 1:
+                    loss = self.loss_fn(net=self.net,
+                                        batch=val_batch,
+                                        epoch=epoch,
+                                        step=step,
+                                        opt_idx=1,
+                                        stage='val',
+                                        write=False)
+                    dloss_sum += loss
             step += 1
         average_loss = loss_sum / step
         self.writer.add_scalar(f'val_epoch/loss', average_loss, epoch)
@@ -351,12 +353,16 @@ class BaseRunner(ABC):
             # test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
             train_loader = DataLoader(train_dataset,
                                       batch_size=self.config.data.train.batch_size,
-                                      num_workers=1,
+                                      num_workers=8,
+                                      pin_memory=True,
+                                      persistent_workers=False,
                                       drop_last=True,
                                       sampler=train_sampler)
             val_loader = DataLoader(val_dataset,
                                     batch_size=self.config.data.val.batch_size,
-                                    num_workers=1,
+                                    num_workers=2,
+                                    pin_memory=True,
+                                    persistent_workers=True,
                                     drop_last=True,
                                     sampler=val_sampler)
             # test_loader = DataLoader(test_dataset,
@@ -368,12 +374,16 @@ class BaseRunner(ABC):
             train_loader = DataLoader(train_dataset,
                                       batch_size=self.config.data.train.batch_size,
                                       shuffle=self.config.data.train.shuffle,
-                                      num_workers=1,
+                                      num_workers=8,
+                                      pin_memory=True,
+                                      persistent_workers=False,
                                       drop_last=False)
             val_loader = DataLoader(val_dataset,
                                     batch_size=self.config.data.val.batch_size,
                                     shuffle=self.config.data.val.shuffle,
-                                    num_workers=1,
+                                    num_workers=2,
+                                    pin_memory=True,
+                                    persistent_workers=True,
                                     drop_last=False)
             # test_loader = DataLoader(test_dataset,
             #                          batch_size=self.config.data.test.batch_size,
@@ -387,6 +397,7 @@ class BaseRunner(ABC):
             f"start training {self.config.model.model_name} on {self.config.data.dataset_name}, {len(train_loader)} iters per epoch")
 
         try:
+            scaler = torch.cuda.amp.GradScaler()
             accumulate_grad_batches = self.config.training.accumulate_grad_batches
             for epoch in range(start_epoch, self.config.training.n_epochs):
                 if self.global_step > self.config.training.n_steps:
@@ -399,27 +410,31 @@ class BaseRunner(ABC):
                 pbar = tqdm(train_loader, total=len(train_loader), smoothing=0.01)
                 self.global_epoch = epoch
                 start_time = time.time()
+                val_iter = iter(val_loader)
                 for train_batch in pbar:
                     self.global_step += 1
                     self.net.train()
 
                     losses = []
                     for i in range(len(self.optimizer)):
-                        # pdb.set_trace()
-                        loss = self.loss_fn(net=self.net,
-                                            batch=train_batch,
-                                            epoch=epoch,
-                                            step=self.global_step,
-                                            opt_idx=i,
-                                            stage='train')
+                        with torch.cuda.amp.autocast():
+                            loss = self.loss_fn(net=self.net,
+                                                batch=train_batch,
+                                                epoch=epoch,
+                                                step=self.global_step,
+                                                opt_idx=i,
+                                                stage='train')
 
-                        loss.backward()
+                        scaler.scale(loss).backward()
                         if self.global_step % accumulate_grad_batches == 0:
-                            self.optimizer[i].step()
-                            self.optimizer[i].zero_grad()
+                            scaler.step(self.optimizer[i])
+                            self.optimizer[i].zero_grad(set_to_none=True)
                             if self.scheduler is not None:
                                 self.scheduler[i].step(loss)
                         losses.append(loss.detach().mean())
+
+                    if self.global_step % accumulate_grad_batches == 0:
+                        scaler.update()
 
                     if self.use_ema and self.global_step % (self.update_ema_interval*accumulate_grad_batches) == 0:
                         self.step_ema()
@@ -441,16 +456,21 @@ class BaseRunner(ABC):
 
                     with torch.no_grad():
                         if self.global_step % 50 == 0:
-                            val_batch = next(iter(val_loader))
+                            try:
+                                val_batch = next(val_iter)
+                            except StopIteration:
+                                val_iter = iter(val_loader)
+                                val_batch = next(val_iter)
                             self.validation_step(val_batch=val_batch, epoch=epoch, step=self.global_step)
 
                         if self.global_step % int(self.config.training.sample_interval * epoch_length) == 0:
-                            # val_batch = next(iter(val_loader))
-                            # self.validation_step(val_batch=val_batch, epoch=epoch, step=self.global_step)
-
                             if not self.config.training.use_DDP or \
                                     (self.config.training.use_DDP and self.config.training.local_rank) == 0:
-                                val_batch = next(iter(val_loader))
+                                try:
+                                    val_batch = next(val_iter)
+                                except StopIteration:
+                                    val_iter = iter(val_loader)
+                                    val_batch = next(val_iter)
                                 self.sample_step(val_batch=val_batch, train_batch=train_batch)
                                 torch.cuda.empty_cache()
 
@@ -570,14 +590,18 @@ class BaseRunner(ABC):
             test_loader = DataLoader(test_dataset,
                                      batch_size=self.config.data.test.batch_size,
                                      shuffle=False,
-                                     num_workers=1,
+                                     num_workers=4,
+                                     pin_memory=True,
+                                     persistent_workers=True,
                                      drop_last=True,
                                      sampler=test_sampler)
         else:
             test_loader = DataLoader(test_dataset,
                                      batch_size=self.config.data.test.batch_size,
                                      shuffle=False,
-                                     num_workers=1,
+                                     num_workers=4,
+                                     pin_memory=True,
+                                     persistent_workers=True,
                                      drop_last=False)
 
         if self.use_ema:

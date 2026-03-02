@@ -64,9 +64,9 @@ class BBDMRunner(DiffusionBaseRunner):
 
     def initialize_optimizer_scheduler(self, net, config):
         optimizer = get_optimizer(config.model.BB.optimizer, net.get_parameters())
+        #verbose=True,
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer,
                                                                mode='min',
-                                                               verbose=True,
                                                                threshold_mode='rel',
                                                                **vars(config.model.BB.lr_scheduler)
 )
@@ -170,31 +170,19 @@ class BBDMRunner(DiffusionBaseRunner):
         (x, x_name), (x_cond, x_cond_name), *context = batch
         context = context[0] if context else None
 
-        x = x.to(self.config.training.device[0])
-        x_cond = x_cond.to(self.config.training.device[0])
+        x = x.to(self.config.training.device[0], non_blocking=True)
+        x_cond = x_cond.to(self.config.training.device[0], non_blocking=True)
         if context is not None:
-            context = context.to(self.config.training.device[0])
+            context = context.to(self.config.training.device[0], non_blocking=True)
 
         loss, additional_info = net(x, x_cond, context=context)
         if write:
             self.writer.add_scalar(f'loss/{stage}', loss, step)
-            try:
-                wandb.log({f"loss/{stage}": loss}, step=step)
-            except:
-                print(f'Could not log loss to wandb')
             if additional_info.__contains__('recloss_noise'):
                 self.writer.add_scalar(f'recloss_noise/{stage}', additional_info['recloss_noise'], step)
-                try:
-                    wandb.log({f"recloss_noise/{stage}": additional_info["recloss_noise"]}, step=step)
-                except:
-                    print(f'Could not log recloss_noise to wandb')   
                         
             if additional_info.__contains__('recloss_xy'):
                 self.writer.add_scalar(f'recloss_xy/{stage}', additional_info['recloss_xy'], step)
-                try:
-                    wandb.log({f"recloss_xy/{stage}": additional_info["recloss_xy"]}, step=step)
-                except:
-                    print(f'Could not log recloss_xy to wandb')
         return loss
 
     @torch.no_grad()

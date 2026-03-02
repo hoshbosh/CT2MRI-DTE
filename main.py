@@ -9,6 +9,7 @@ import numpy as np
 from utils import dict2namespace, get_runner, namespace2dict
 import torch.multiprocessing as mp
 import torch.distributed as dist
+import datasets.custom
 
 import wandb
 
@@ -136,8 +137,8 @@ def set_random_seed(SEED=1234):
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
 
 def DDP_run_fn(rank, world_size, config):

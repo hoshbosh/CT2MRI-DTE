@@ -84,8 +84,8 @@ def create_hdf5_dataset(args):
     # subject_dir = df[df['set'] in args.which_set].index.tolist()
     
     # excepted
-    dataset_info = pd.read_csv('/root_dir/datasets/dataset.csv')
-    df = df[~df.index.isin(dataset_info.loc[dataset_info['except'] == 1, 'pid'])]
+    # dataset_info = pd.read_csv('/Users/hosh/dataset/Task1/real_copy/data.csv')
+    # df = df[~df.index.isin(dataset_info.loc[dataset_info['except'] == 1, 'pid'])]
     # df.to_csv('/root_dir/datasets/dataset_split_info.csv')
     
     subject_dir = df[df['set'].str.contains(args.which_set)].index.tolist()
@@ -121,10 +121,14 @@ def create_hdf5_dataset(args):
         # # Append finally processed images to arrays
         CT_dataset = np.append(CT_dataset, CT_data, axis=2)
         MR_dataset = np.append(MR_dataset, MR_data, axis=2)
-        index_dataset = np.append(index_dataset, np.arange(CT_data.shape[2], dtype=np.uint8), axis=0)
-        max_index_dataset = np.append(max_index_dataset, np.full(CT_data.shape[2], CT_data.shape[2]-1, dtype=np.uint8), axis=0)
+        slices = CT_data.shape[2]
+        if CT_data.shape[2] > 255:
+            print(f"Warning: Number of slices {CT_data.shape[2]} exceeds 255, truncating max_index_dataset to 255.")
+            slices = 255
+        index_dataset = np.append(index_dataset, np.arange(slices, dtype=np.uint8), axis=0)
+        max_index_dataset = np.append(max_index_dataset, np.full(slices, slices-1, dtype=np.uint8), axis=0)
         sub_name = current_subject.split("/")[-1]
-        subjects.extend([sub_name.encode("ascii", "ignore")] * CT_data.shape[2])
+        subjects.extend([sub_name.encode("ascii", "ignore")] * slices)
         # subjects.append(sub_name.encode("ascii", "ignore"))
 
         end = time.time() - start

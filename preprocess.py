@@ -248,7 +248,7 @@ def write_split_csv(output_dir: str, subject_names: list, test_ratio: float = 0.
     csv_path = os.path.join(output_dir, "split.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["pid", "test"])
+        writer.writerow(["pid", "split"])
         for name in sorted(subject_names):
             split = "test" if name in test_set else "train"
             writer.writerow([name, split])

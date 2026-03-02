@@ -1,0 +1,8 @@
+/home/joshua.labasbas/CT2MRI-DTE
+c0710a-s19.ufhpc
+Fri Feb 27 07:10:32 PM EST 2026
+
+Lmod is automatically replacing "python/3.10" with "conda/25.7.0".
+
+mkdir: cannot create directory ‘./datasets/hdf5_log’: File exists
+Fri Feb 27 08:56:29 PM EST 2026

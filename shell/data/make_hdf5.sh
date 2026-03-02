@@ -1,25 +1,21 @@
 
-for HW in 160 
+mkdir ./datasets/hdf5_log
+for which in "train" "valid" "test"
 do
-    CT_name="CT_preprocessed_$HW.nii"
-    MR_name="MR_preprocessed_$HW.nii"
-
-    for which in "train" "valid" "test"
+    # for plane in "axial" "sagittal" "coronal"
+    for plane in "axial"
     do
-        # for plane in "axial" "sagittal" "coronal"
-        for plane in "axial"
-        do
-        python -u brain_dataset_utils/generate_total_hdf5_csv.py \
-                --plane  $plane\
-                --which_set $which \
-                --height $HW \
-                --width $HW \
-                --hdf5_name "/root_dir/datasets/${HW}_${which}_${plane}.hdf5" \
-                --data_dir "/root_dir/datasets/raw_data" \
-                --data_csv "/root_dir/datasets/dataset_split.csv" \
-                --CT_name $CT_name \
-                --MR_name $MR_name \
-                > /root_dir/datasets/hdf5_log/${HW}_${which}_${plane}.log
-        done      
-    done
-done      
+    touch ./datasets/hdf5_log/180_${which}_${plane}.log
+    python -u brain_dataset_utils/generate_total_hdf5_csv.py \
+            --plane  $plane\
+            --which_set $which \
+            --height 180 \
+            --width 180 \
+            --hdf5_name "/blue/neurology-dept/jlabasbas/hdf5s/180_${which}_${plane}.hdf5" \
+            --data_dir "/blue/neurology-dept/jlabasbas/out" \
+            --data_csv "/blue/neurology-dept/jlabasbas/out/data.csv" \
+            --CT_name "ct.nii" \
+            --MR_name "mr.nii" \
+            > ./datasets/hdf5_log/180_${which}_${plane}.log
+    done      
+done

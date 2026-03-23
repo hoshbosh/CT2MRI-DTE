@@ -1,2 +1,5 @@
 *__pycache__*
-
+*log
+*wandb*
+*api*
+ct2mri_*.sh

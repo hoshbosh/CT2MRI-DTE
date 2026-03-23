@@ -65,20 +65,20 @@ def create_hdf5_dataset(args):
         histograms, _ = np.histogram(MR_data, bins=num_bins, range=(0.001, 1))
         normalized_histograms = histograms / histograms.sum(keepdims=True)
         normalized_histograms *= scale
-        fig_out_path = f'/root_dir/datasets/{modal}_hists_global_{args.height}/{sub_name}.png'
+        fig_out_path = f'./datasets/{modal}_hists_global_{args.height}/{sub_name}.png'
         os.makedirs(os.path.dirname(fig_out_path), exist_ok=True)
         if visualize:
             visualize_histogram(normalized_histograms, num_bins, fig_out_path)
         
         cum_hist = np.cumsum(normalized_histograms)
-        fig_out_path = f'/root_dir/datasets/{modal}_hists_global_{args.height}/{sub_name}_cum.png'
+        fig_out_path = f'./datasets/{modal}_hists_global_{args.height}/{sub_name}_cum.png'
         if visualize:
             visualize_histogram(cum_hist, num_bins, fig_out_path)
 
         hist_diff = np.diff(normalized_histograms)
         hist_diff = np.insert(hist_diff, 0, hist_diff[0])
         hist_diff *= scale
-        fig_out_path = f'/root_dir/datasets/{modal}_hists_global_{args.height}/{sub_name}_diff.png'
+        fig_out_path = f'./datasets/{modal}_hists_global_{args.height}/{sub_name}_diff.png'
         if visualize:
             visualize_histogram(hist_diff, num_bins, fig_out_path)
         combined_histogram = np.stack((normalized_histograms, cum_hist, hist_diff), axis=1)
@@ -146,13 +146,13 @@ def create_hdf5_dataset_avg(args):
         histograms, _ = np.histogram(MR_data, bins=num_bins, range=(0.001, 1))
         normalized_histograms = histograms / histograms.sum(keepdims=True)
         normalized_histograms *= scale
-        fig_out_path = f'/root_dir/datasets/{modal}_hists_global_ver3/{sub_name}.png'
+        fig_out_path = f'./datasets/{modal}_hists_global_ver3/{sub_name}.png'
         if visualize:
             visualize_histogram(normalized_histograms, num_bins, fig_out_path)
         normalized_list.append(normalized_histograms)
         
         cum_hist = np.cumsum(normalized_histograms)
-        fig_out_path = f'/root_dir/datasets/{modal}_hists_global_ver3/{sub_name}_cum.png'
+        fig_out_path = f'./datasets/{modal}_hists_global_ver3/{sub_name}_cum.png'
         if visualize:
             visualize_histogram(cum_hist, num_bins, fig_out_path)
         cum_hist_list.append(cum_hist)
@@ -160,7 +160,7 @@ def create_hdf5_dataset_avg(args):
         hist_diff = np.diff(normalized_histograms)
         hist_diff = np.insert(hist_diff, 0, hist_diff[0])
         hist_diff *= scale
-        fig_out_path = f'/root_dir/datasets/{modal}_hists_global_ver3/{sub_name}_diff.png'
+        fig_out_path = f'./datasets/{modal}_hists_global_ver3/{sub_name}_diff.png'
         if visualize:
             visualize_histogram(hist_diff, num_bins, fig_out_path)
         hist_diff_list.append(hist_diff)
@@ -214,7 +214,7 @@ def create_hdf5_dataset_colin(args):
     
     hist_dataset = {}
 
-    colin_path = '/root_dir/datasets/colin27/colin27_t1_tal_lin_preprocessed.nii'
+    colin_path = './datasets/colin27/colin27_t1_tal_lin_preprocessed.nii'
     MR_data = nib.load(colin_path)
     MR_data = np.asanyarray(MR_data.dataobj)
     MR_data = np.nan_to_num(MR_data)
@@ -223,20 +223,20 @@ def create_hdf5_dataset_colin(args):
     histograms, _ = np.histogram(MR_data, bins=num_bins, range=(0.001, 1))
     normalized_histograms = histograms / histograms.sum(keepdims=True)
     normalized_histograms *= scale
-    fig_out_path = f'/root_dir/datasets/colin_hists_global_ver3/hist.png'
+    fig_out_path = f'./datasets/colin_hists_global_ver3/hist.png'
     os.makedirs(os.path.dirname(fig_out_path), exist_ok=True)
     if visualize:
         visualize_histogram(normalized_histograms, num_bins, fig_out_path)
     
     cum_hist = np.cumsum(normalized_histograms)
-    fig_out_path = f'/root_dir/datasets/colin_hists_global_ver3/hist_cum.png'
+    fig_out_path = f'./datasets/colin_hists_global_ver3/hist_cum.png'
     if visualize:
         visualize_histogram(cum_hist, num_bins, fig_out_path)
 
     hist_diff = np.diff(normalized_histograms)
     hist_diff = np.insert(hist_diff, 0, hist_diff[0])
     hist_diff *= scale
-    fig_out_path = f'/root_dir/datasets/colin_hists_global_ver3/hist_diff.png'
+    fig_out_path = f'./datasets/colin_hists_global_ver3/hist_diff.png'
     if visualize:
         visualize_histogram(hist_diff, num_bins, fig_out_path)
     combined_histogram = np.stack((normalized_histograms, cum_hist, hist_diff), axis=1)

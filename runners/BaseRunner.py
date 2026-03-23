@@ -36,6 +36,7 @@ class BaseRunner(ABC):
 
         self.GAN_buffer = {}  # GAN buffer for Generative Adversarial Network
         self.topk_checkpoints = {}  # Top K checkpoints
+        self.is_main_process = not config.training.use_DDP or getattr(config.training, 'local_rank', 0) == 0
 
         # set log and save destination
         self.config.result = argparse.Namespace()
@@ -72,6 +73,17 @@ class BaseRunner(ABC):
         else:
             self.net = self.net.to(self.config.training.device[0])
         # self.ema.reset_device(self.net)
+
+        # torch.compile: store uncompiled reference for validation/EMA/checkpointing
+        self._uncompiled_net = self.net
+        if getattr(self.config.training, 'use_compile', False):
+            print("Compiling model with torch.compile...")
+            self.net = torch.compile(self.net)
+            print("Model compiled successfully.")
+
+        # wandb model watching (gradients + parameters) — only on rank 0
+        if wandb.run is not None:
+            wandb.watch(self._uncompiled_net, log='all', log_freq=500)
 
     # save configuration file
     def save_config(self):
@@ -112,12 +124,32 @@ class BaseRunner(ABC):
             self.global_epoch = model_states['epoch']
             self.global_step = model_states['step']
 
-            # load model
-            self.net.load_state_dict(model_states['model'])
+            # load model (filter out shape-mismatched keys before loading)
+            current_state = self.net.state_dict()
+            filtered_state = {}
+            shape_mismatch = []
+            for k, v in model_states['model'].items():
+                if k in current_state and current_state[k].shape != v.shape:
+                    shape_mismatch.append(k)
+                else:
+                    filtered_state[k] = v
+            missing, unexpected = self.net.load_state_dict(filtered_state, strict=False)
+            if shape_mismatch:
+                print(f"  Shape-mismatched keys (randomly initialized): {shape_mismatch}")
+            if missing:
+                print(f"  Missing keys (randomly initialized): {missing}")
+            if unexpected:
+                print(f"  Unexpected keys (ignored): {unexpected}")
 
-            # load ema
+            # load ema (rebuild shadow from current model, then overwrite matching keys)
             if self.use_ema:
-                self.ema.shadow = model_states['ema']
+                new_shadow = {}
+                for name, param in self.net.named_parameters():
+                    if name in model_states['ema'] and model_states['ema'][name].shape == param.shape:
+                        new_shadow[name] = model_states['ema'][name]
+                    else:
+                        new_shadow[name] = param.data.clone()
+                self.ema.shadow = new_shadow
                 self.ema.reset_device(self.net)
 
             # load optimizer and scheduler
@@ -151,9 +183,9 @@ class BaseRunner(ABC):
         }
 
         if self.config.training.use_DDP:
-            model_states['model'] = self.net.module.state_dict()
+            model_states['model'] = self._uncompiled_net.module.state_dict()
         else:
-            model_states['model'] = self.net.state_dict()
+            model_states['model'] = self._uncompiled_net.state_dict()
 
         if stage == 'exception':
             model_states['epoch'] = self.global_epoch
@@ -168,38 +200,38 @@ class BaseRunner(ABC):
     def step_ema(self):
         with_decay = False if self.global_step < self.start_ema_step else True
         if self.config.training.use_DDP:
-            self.ema.update(self.net.module, with_decay=with_decay)
+            self.ema.update(self._uncompiled_net.module, with_decay=with_decay)
         else:
-            self.ema.update(self.net, with_decay=with_decay)
+            self.ema.update(self._uncompiled_net, with_decay=with_decay)
 
     def apply_ema(self):
         if self.use_ema:
             if self.config.training.use_DDP:
-                self.ema.apply_shadow(self.net.module)
+                self.ema.apply_shadow(self._uncompiled_net.module)
             else:
-                self.ema.apply_shadow(self.net)
+                self.ema.apply_shadow(self._uncompiled_net)
 
     def restore_ema(self):
         if self.use_ema:
             if self.config.training.use_DDP:
-                self.ema.restore(self.net.module)
+                self.ema.restore(self._uncompiled_net.module)
             else:
-                self.ema.restore(self.net)
+                self.ema.restore(self._uncompiled_net)
 
     # Evaluation and sample part
     @torch.no_grad()
     def validation_step(self, val_batch, epoch, step):
         self.apply_ema()
-        self.net.eval()
+        self._uncompiled_net.eval()
         with torch.cuda.amp.autocast():
-            loss = self.loss_fn(net=self.net,
+            loss = self.loss_fn(net=self._uncompiled_net,
                                 batch=val_batch,
                                 epoch=epoch,
                                 step=step,
                                 opt_idx=0,
                                 stage='val_step')
             if len(self.optimizer) > 1:
-                loss = self.loss_fn(net=self.net,
+                loss = self.loss_fn(net=self._uncompiled_net,
                                     batch=val_batch,
                                     epoch=epoch,
                                     step=step,
@@ -210,7 +242,7 @@ class BaseRunner(ABC):
     @torch.no_grad()
     def validation_epoch(self, val_loader, epoch):
         self.apply_ema()
-        self.net.eval()
+        self._uncompiled_net.eval()
 
         pbar = tqdm(val_loader, total=len(val_loader), smoothing=0.01)
         step = 0
@@ -218,7 +250,7 @@ class BaseRunner(ABC):
         dloss_sum = 0.
         for val_batch in pbar:
             with torch.cuda.amp.autocast():
-                loss = self.loss_fn(net=self.net,
+                loss = self.loss_fn(net=self._uncompiled_net,
                                     batch=val_batch,
                                     epoch=epoch,
                                     step=step,
@@ -227,7 +259,7 @@ class BaseRunner(ABC):
                                     write=False)
                 loss_sum += loss
                 if len(self.optimizer) > 1:
-                    loss = self.loss_fn(net=self.net,
+                    loss = self.loss_fn(net=self._uncompiled_net,
                                         batch=val_batch,
                                         epoch=epoch,
                                         step=step,
@@ -256,14 +288,14 @@ class BaseRunner(ABC):
     @torch.no_grad()
     def sample_step(self, train_batch, val_batch):
         self.apply_ema()
-        self.net.eval()
+        self._uncompiled_net.eval()
         sample_path = make_dir(os.path.join(self.config.result.image_path, str(self.global_step)))
         if self.config.training.use_DDP:
-            self.sample(self.net.module, train_batch, sample_path, stage='train')
-            self.sample(self.net.module, val_batch, sample_path, stage='val')
+            self.sample(self._uncompiled_net.module, train_batch, sample_path, stage='train')
+            self.sample(self._uncompiled_net.module, val_batch, sample_path, stage='val')
         else:
-            self.sample(self.net, train_batch, sample_path, stage='train')
-            self.sample(self.net, val_batch, sample_path, stage='val')
+            self.sample(self._uncompiled_net, train_batch, sample_path, stage='train')
+            self.sample(self._uncompiled_net, val_batch, sample_path, stage='val')
         self.restore_ema()
 
     # abstract methods
@@ -353,9 +385,9 @@ class BaseRunner(ABC):
             # test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
             train_loader = DataLoader(train_dataset,
                                       batch_size=self.config.data.train.batch_size,
-                                      num_workers=8,
+                                      num_workers=4,
                                       pin_memory=True,
-                                      persistent_workers=False,
+                                      persistent_workers=True,
                                       drop_last=True,
                                       sampler=train_sampler)
             val_loader = DataLoader(val_dataset,
@@ -374,9 +406,9 @@ class BaseRunner(ABC):
             train_loader = DataLoader(train_dataset,
                                       batch_size=self.config.data.train.batch_size,
                                       shuffle=self.config.data.train.shuffle,
-                                      num_workers=8,
+                                      num_workers=4,
                                       pin_memory=True,
-                                      persistent_workers=False,
+                                      persistent_workers=True,
                                       drop_last=False)
             val_loader = DataLoader(val_dataset,
                                     batch_size=self.config.data.val.batch_size,
@@ -399,6 +431,7 @@ class BaseRunner(ABC):
         try:
             scaler = torch.cuda.amp.GradScaler()
             accumulate_grad_batches = self.config.training.accumulate_grad_batches
+            average_loss = None
             for epoch in range(start_epoch, self.config.training.n_epochs):
                 if self.global_step > self.config.training.n_steps:
                     break
@@ -411,6 +444,7 @@ class BaseRunner(ABC):
                 self.global_epoch = epoch
                 start_time = time.time()
                 val_iter = iter(val_loader)
+                grad_norm = None
                 for train_batch in pbar:
                     self.global_step += 1
                     self.net.train()
@@ -427,6 +461,8 @@ class BaseRunner(ABC):
 
                         scaler.scale(loss).backward()
                         if self.global_step % accumulate_grad_batches == 0:
+                            scaler.unscale_(self.optimizer[i])
+                            grad_norm = torch.nn.utils.clip_grad_norm_(self._uncompiled_net.parameters(), max_norm=1.0)
                             scaler.step(self.optimizer[i])
                             self.optimizer[i].zero_grad(set_to_none=True)
                             if self.scheduler is not None:
@@ -435,6 +471,20 @@ class BaseRunner(ABC):
 
                     if self.global_step % accumulate_grad_batches == 0:
                         scaler.update()
+
+                    # wandb logging: LR, GPU memory, throughput, gradient norm (rank 0 only)
+                    if self.is_main_process and self.global_step % 100 == 0:
+                        try:
+                            log_dict = {
+                                'train/grad_norm': grad_norm.item() if grad_norm is not None else 0,
+                                'train/lr': self.optimizer[0].param_groups[0]['lr'],
+                                'train/gpu_mem_allocated_mb': torch.cuda.memory_allocated() / 1e6,
+                                'train/gpu_mem_reserved_mb': torch.cuda.memory_reserved() / 1e6,
+                                'train/epoch': epoch + 1,
+                            }
+                            wandb.log(log_dict, step=self.global_step)
+                        except:
+                            pass
 
                     if self.use_ema and self.global_step % (self.update_ema_interval*accumulate_grad_batches) == 0:
                         self.step_ema()
@@ -455,7 +505,7 @@ class BaseRunner(ABC):
                         )
 
                     with torch.no_grad():
-                        if self.global_step % 50 == 0:
+                        if self.global_step % 500 == 0:
                             try:
                                 val_batch = next(val_iter)
                             except StopIteration:
@@ -524,7 +574,7 @@ class BaseRunner(ABC):
                             model_ckpt_name = f'top_model_epoch_{epoch + 1}.pth'
                             optim_sche_ckpt_name = f'top_optim_sche_epoch_{epoch + 1}.pth'
 
-                            if self.config.args.save_top:
+                            if self.config.args.save_top and average_loss is not None:
                                 print("save top model start...")
                                 top_key = 'top'
                                 if top_key not in self.topk_checkpoints:
@@ -607,13 +657,13 @@ class BaseRunner(ABC):
         if self.use_ema:
             self.apply_ema()
 
-        self.net.eval()
+        self._uncompiled_net.eval()
         if self.config.args.sample_to_eval:
             sample_path = self.config.result.sample_to_eval_path
             if self.config.training.use_DDP:
-                self.sample_to_eval(self.net.module, test_loader, sample_path)
+                self.sample_to_eval(self._uncompiled_net.module, test_dataset, sample_path)
             else:
-                self.sample_to_eval(self.net, test_dataset, sample_path)
+                self.sample_to_eval(self._uncompiled_net, test_dataset, sample_path)
 
         else:
             test_iter = iter(test_loader)
@@ -621,9 +671,9 @@ class BaseRunner(ABC):
                 test_batch = next(test_iter)
                 sample_path = os.path.join(self.config.result.sample_path, str(i))
                 if self.config.training.use_DDP:
-                    self.sample(self.net.module, test_batch, sample_path, stage='test')
+                    self.sample(self._uncompiled_net.module, test_batch, sample_path, stage='test')
                 else:
-                    self.sample(self.net, test_batch, sample_path, stage='test')
+                    self.sample(self._uncompiled_net, test_batch, sample_path, stage='test')
 
         try: 
             wandb.finish()

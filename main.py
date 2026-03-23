@@ -10,6 +10,7 @@ from utils import dict2namespace, get_runner, namespace2dict
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import datasets.custom
+import datasets.augmented
 
 import wandb
 
@@ -106,28 +107,32 @@ def parse_args_and_config():
 
     dict_config = namespace2dict(namespace_config)
     
-    config_dict = {"train": args.train,
-                   "gpu_ids": args.gpu_ids,
-                   "dataset_type": namespace_config.data.dataset_type,
-                   "image_size": namespace_config.data.dataset_config.image_size,
-                   "max_epoch": namespace_config.training.n_epochs,
-                   "n_steps": namespace_config.training.n_steps,
-                   "batch_size": namespace_config.data.train.batch_size,
-                   "mt_type": namespace_config.model.BB.params.mt_type,
-                   "objective": namespace_config.model.BB.params.objective,
-                   "loss_type": namespace_config.model.BB.params.loss_type,
-                   "sample_step": namespace_config.model.BB.params.sample_step,
-                   "num_timesteps": namespace_config.model.BB.params.num_timesteps,
-                   "ddim_eta": namespace_config.model.BB.params.eta,
-                   "max_var": namespace_config.model.BB.params.max_var,
-                   }
-    if not args.sample_to_eval:
-        try:
-            wandb.init(project="", entity="", name=namespace_config.model.model_name, config=config_dict)
-        except:
-            print('Could not init wandb')
-    
     return namespace_config, dict_config
+
+
+def init_wandb(config):
+    """Initialize wandb. Should only be called once, on rank 0 (or single-GPU)."""
+    if config.args.sample_to_eval:
+        return
+    try:
+        config_dict = {"train": config.args.train,
+                       "gpu_ids": config.args.gpu_ids,
+                       "dataset_type": config.data.dataset_type,
+                       "image_size": config.data.dataset_config.image_size,
+                       "max_epoch": config.training.n_epochs,
+                       "n_steps": config.training.n_steps,
+                       "batch_size": config.data.train.batch_size,
+                       "mt_type": config.model.BB.params.mt_type,
+                       "objective": config.model.BB.params.objective,
+                       "loss_type": config.model.BB.params.loss_type,
+                       "sample_step": config.model.BB.params.sample_step,
+                       "num_timesteps": config.model.BB.params.num_timesteps,
+                       "ddim_eta": config.model.BB.params.eta,
+                       "max_var": config.model.BB.params.max_var,
+                       }
+        wandb.init(project="research-dbs", entity="jlabasbas-university-of-florida", name=config.model.model_name, config=config_dict)
+    except:
+        print('Could not init wandb')
 
 
 def set_random_seed(SEED=1234):
@@ -139,6 +144,8 @@ def set_random_seed(SEED=1234):
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def DDP_run_fn(rank, world_size, config):
@@ -153,6 +160,10 @@ def DDP_run_fn(rank, world_size, config):
     config.training.device = [torch.device("cuda:%d" % local_rank)]
     print('using device:', config.training.device)
     config.training.local_rank = local_rank
+
+    if local_rank == 0:
+        init_wandb(config)
+
     runner = get_runner(config.runner, config)
     if config.args.train:
         runner.train()
@@ -164,6 +175,7 @@ def DDP_run_fn(rank, world_size, config):
 
 def CPU_singleGPU_launcher(config):
     set_random_seed(config.args.seed)
+    init_wandb(config)
     runner = get_runner(config.runner, config)
     if config.args.train:
         runner.train()
@@ -174,6 +186,7 @@ def CPU_singleGPU_launcher(config):
 
 
 def DDP_launcher(world_size, run_fn, config):
+    print("launching ddps")
     mp.spawn(run_fn,
              args=(world_size, copy.deepcopy(config)),
              nprocs=world_size,
@@ -192,6 +205,7 @@ def main():
     else:
         gpu_list = gpu_ids.split(",")
         if len(gpu_list) > 1:
+            print("using cpus")
             os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
             nconfig.training.use_DDP = True
             DDP_launcher(world_size=len(gpu_list), run_fn=DDP_run_fn, config=nconfig)

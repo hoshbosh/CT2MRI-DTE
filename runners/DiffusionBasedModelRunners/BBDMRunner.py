@@ -178,6 +178,10 @@ class BBDMRunner(DiffusionBaseRunner):
         loss, additional_info = net(x, x_cond, context=context)
         if write:
             self.writer.add_scalar(f'loss/{stage}', loss, step)
+            try:
+                wandb.log({f"loss/{stage}": loss}, step=step)
+            except:
+                print(f'Could not log loss to wandb')
             if additional_info.__contains__('recloss_noise'):
                 self.writer.add_scalar(f'recloss_noise/{stage}', additional_info['recloss_noise'], step)
                         
@@ -238,10 +242,6 @@ class BBDMRunner(DiffusionBaseRunner):
     @torch.no_grad()
     def sample_to_eval(self, net, test_dataset, sample_path):
         start_time = time.time()
-        
-        raw_data_dir = "/root_dir/datasets/raw_data_tight"
-        if 'BraTS' in sample_path:
-            raw_data_dir = "/root_dir/BraTS/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
 
         mid_slice = self.config.data.dataset_config.channels // 2
         H = self.config.data.dataset_config.image_size
@@ -254,58 +254,71 @@ class BBDMRunner(DiffusionBaseRunner):
         sample_path = os.path.join(sample_path, f"{inference_type}_{sample_step}")
         if 'ISTA' in inference_type:
             sample_path = os.path.join(sample_path, f"{inference_type}_{sample_step}_{ISTA_step_size}_{num_ISTA_step}")
-            
+
         if "colin" in dataset_type:
             sample_path += '_colin'
         elif "best" in dataset_type:
             sample_path += '_best_meanmax'
         elif "average" in dataset_type:
             sample_path += '_average'
-            
+
         print(f"sample_path: {sample_path}")
         os.makedirs(sample_path, exist_ok=True)
-        
+
+        # Group slices by patient, keeping both data and ground truth
         batch_dict = defaultdict(list)
+        gt_dict = defaultdict(list)
         for idx in range(len(test_dataset)):
-            pid = test_dataset[idx][0][1].decode('utf-8')
-            batch_dict[pid].append(test_dataset[idx])
-        
+            sample_item = test_dataset[idx]
+            pid = sample_item[0][1].decode('utf-8')
+            batch_dict[pid].append(sample_item)
+            # Extract ground truth MR mid-slice from the dataset
+            gt_slice = sample_item[0][0][mid_slice]  # ground truth MR, mid channel
+            gt_dict[pid].append(gt_slice)
+
         metrics_dict = defaultdict(dict)
         for pid in tqdm(batch_dict.keys()):
             out_path = os.path.join(sample_path, f'{pid}.nii')
-            if os.path.exists(out_path):
-                syn_img = nib.load(out_path).get_fdata()
-                syn_img = np.nan_to_num(syn_img)
-                raw_img = nib.load(os.path.join(raw_data_dir, pid, f"cropped_{pid}-t1n_preprocessed.nii")).get_fdata()
-                raw_img = np.nan_to_num(raw_img)
-                calcul_metrics(metrics_dict, pid, syn_img, raw_img)
-                continue
+
+            # Build ground truth volume from dataset slices
+            gt_slices = np.stack(gt_dict[pid], axis=0)  # [num_slices, H, W]
+            if self.config.data.dataset_config.to_normal:
+                gt_slices = gt_slices * 0.5 + 0.5  # denormalize [-1,1] -> [0,1]
+            gt_slices = np.clip(gt_slices, 0, 1)
+            gt_volume = np.transpose(gt_slices, (1, 2, 0))  # [H, W, num_slices]
+
+            # Always regenerate (don't use cached .nii from previous runs)
 
             test_batch = default_collate(batch_dict[pid])
             (x, x_name), (x_cond, x_cond_name), *context = test_batch
             context = context[0] if context else None
-            x_cond = x_cond.to(self.config.training.device[0], non_blocking=True)            
+            x_cond = x_cond.to(self.config.training.device[0], non_blocking=True)
             if context is not None:
                 context = context.to(self.config.training.device[0], non_blocking=True)
 
             sample = net.sample(x, x_cond, x_cond_name, context=context, clip_denoised=False, path=sample_path, save=False, config=self.config, device=self.config.training.device[0])
             sample = sample[:, mid_slice].detach().clone().cpu().mul_(0.5).add_(0.5).clamp_(0, 1.)
-            
-            raw_image_path = os.path.join(raw_data_dir, pid, f"cropped_MR_preprocessed_{H}.nii")
-            if 'BraTS' in sample_path:
-                raw_image_path = os.path.join(raw_data_dir, pid, f"cropped_{pid}-t1n_preprocessed.nii")
-            syn_img, raw_img, pid = save_syn_image(sample, raw_image_path, out_path, pid)
-            calcul_metrics(metrics_dict, pid, syn_img, raw_img)
-                    
+
+            # Save synthetic volume as NIfTI
+            syn_volume = sample.numpy().transpose(1, 2, 0)  # [H, W, num_slices]
+            syn_nii = nib.Nifti1Image(syn_volume, np.eye(4))
+            nib.save(syn_nii, out_path)
+            print(f'saved_id: {pid}')
+
+            syn_img = syn_volume
+            print(f"  syn range: [{syn_img.min():.4f}, {syn_img.max():.4f}], mean: {syn_img.mean():.4f}")
+            print(f"  gt  range: [{gt_volume.min():.4f}, {gt_volume.max():.4f}], mean: {gt_volume.mean():.4f}")
+            calcul_metrics(metrics_dict, pid, syn_img, gt_volume)
+
         df = pd.DataFrame.from_dict(metrics_dict, orient='index')
         means = df.mean()
         df.loc['mean'] = means
-                
+
         df.to_csv(os.path.join(sample_path, 'results.csv'), index_label='pa_id')
-        
-        results_file = os.path.join('/root_dir/code/results/test_results.csv')
+
+        results_file = os.path.join(sample_path, 'test_results.csv')
         save_exp_result(results_file, self.config, means)
 
         end_time = time.time()
         print_runtime(start_time, end_time)
-        
+

@@ -1,28 +1,27 @@
 #!/bin/bash
-cd /root_dir/code
 
-config_name="BBDM_base.yaml"
+config_name="fine-tune.yaml"
 HW="180"
 plane="axial"
 ddim_eta=0.0
 
 gpu_ids="0"
 
-exp_name="241213_160_BBDM_axial_DDIM_MR_global_hist_context"
+exp_name="241213_180_BBDM_axial_DDIM_MR_global_hist_context"
 
 # test
-test_epoch="34"
-resume_model="/root_dir/code/results/ct2mr_$HW/$exp_name/checkpoint/latest_model_$test_epoch.pth"
-resume_optim="/root_dir/code/results/ct2mr_$HW/$exp_name/checkpoint/latest_optim_sche_$test_epoch.pth"
+test_epoch="81"
+resume_model="./results/fine-tune_180/fine-tune_180/241213_180_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/top_model_epoch_81.pth"
+resume_optim="./results/fine-tune_180/fine-tune_180/241213_180_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/top_optim_sche_epoch_81.pth"
 
-sample_step=100
-inference_type="normal" # normal, average, ISTA_average, ISTA_mid
-ISTA_step_size=0.5
+sample_step=200
+inference_type="ISTA_mid" # normal, average, ISTA_average, ISTA_mid
+ISTA_step_size=2
 num_ISTA_step=1
 
-python /root_dir/code/main.py \
+python ./main.py \
     --exp_name $exp_name \
-    --config /root_dir/code/results/ct2mr_$HW/$exp_name/checkpoint/config_backup.yaml \
+    --config ./results/fine-tune_180/fine-tune_180/241213_180_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/config_backup.yaml\
     --sample_to_eval \
     --gpu_ids $gpu_ids \
     --resume_model $resume_model \

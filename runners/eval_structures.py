@@ -9,6 +9,12 @@ structures directly:
                     synthetic one -- does the structure exist, with the right shape
   centroid_mm       displacement of the structure's centre of mass, in mm.
                     The clinically meaningful quantity for targeting
+  vol_ratio         segmented volume of the synthetic structure over the real
+                    one. 1.00 is a size match; below 1 the model under-fills the
+                    structure. Reported as a ratio because structures differ by
+                    ~10x in size, which a raw voxel delta would hide -- the CSV
+                    also carries n_vox_real/n_vox_syn, the signed d_vox, and both
+                    volumes in mm3 for anyone who wants the absolutes
   ssim / psnr       image fidelity restricted to the structure's bounding box
   cw_ssim           complex-wavelet SSIM on the same patch. CW-SSIM is designed
                     to be tolerant of small translations, so the gap between it
@@ -155,6 +161,12 @@ def main():
     ap.add_argument('--manifest', default=None, help='Phase 1 QC manifest')
     ap.add_argument('--out_csv', default=None,
                     help='Per-subject-per-structure CSV (default: <export_dir>/structure_metrics.csv)')
+    ap.add_argument('--dump_structures', default=None, metavar='DIR',
+                    help='Also write every structure as its own binary NIfTI mask under '
+                         'DIR/<pid>/, as <pid>_<structure>_{real,syn}.nii.gz. Masks '
+                         'inherit the SynthSeg affine, so they overlay on the exported '
+                         'volumes in any viewer. Off by default: 36 subjects x 12 '
+                         'structures x 2 = 864 files.')
     args = ap.parse_args()
 
     manifest = load_manifest(args.manifest)
@@ -183,8 +195,19 @@ def main():
                 f'to completion before scoring; refusing to report a partial cohort.'
             )
 
-        seg_real = np.asanyarray(nib.load(paths['real']).dataobj).astype(np.int32)
+        seg_real_img = nib.load(paths['real'])
+        seg_real = np.asanyarray(seg_real_img.dataobj).astype(np.int32)
         seg_syn = np.asanyarray(nib.load(paths['syn']).dataobj).astype(np.int32)
+
+        # Per-structure masks are written with the segmentation's own affine so
+        # they stay registered to {pid}_real/_syn.nii.gz, which carry the same
+        # geometry (export_eval_volumes.py rebuilds it from geometry.json).
+        seg_affine = seg_real_img.affine
+        vox_mm3 = float(np.prod(spacing))
+        dump_dir = None
+        if args.dump_structures:
+            dump_dir = os.path.join(args.dump_structures, pid)
+            os.makedirs(dump_dir, exist_ok=True)
         real = np.asanyarray(nib.load(
             os.path.join(args.export_dir, f'{pid}_real.nii.gz')).dataobj).astype(np.float32)
         syn = np.asanyarray(nib.load(
@@ -202,8 +225,23 @@ def main():
             mr = seg_real == aseg
             ms = seg_syn == aseg
 
-            row = {'pid': pid, 'structure': name, 'n_vox_real': int(mr.sum()),
-                   'n_vox_syn': int(ms.sum())}
+            n_real, n_syn = int(mr.sum()), int(ms.sum())
+            row = {'pid': pid, 'structure': name,
+                   'n_vox_real': n_real, 'n_vox_syn': n_syn,
+                   'd_vox': n_syn - n_real,
+                   'vol_mm3_real': round(n_real * vox_mm3, 2),
+                   'vol_mm3_syn': round(n_syn * vox_mm3, 2),
+                   # Ratio, not signed difference, is the comparable quantity:
+                   # structures differ ~10x in size, so a raw voxel delta is
+                   # dominated by thalamus. 1.00 is perfect; <1 under-segments.
+                   'vol_ratio': (n_syn / n_real) if n_real else np.nan}
+
+            if dump_dir is not None:
+                for tag, m in (('real', mr), ('syn', ms)):
+                    nib.save(
+                        nib.Nifti1Image(m.astype(np.uint8), seg_affine),
+                        os.path.join(dump_dir, f'{pid}_{name}_{tag}.nii.gz'),
+                    )
 
             if code in excluded:
                 row.update(seg_status='excluded_manifest', dice=np.nan,
@@ -233,7 +271,8 @@ def main():
         print(f'  {pid}  {done}/12 structures scored', flush=True)
 
     fields = ['pid', 'structure', 'seg_status', 'dice', 'centroid_mm', 'ssim',
-              'cw_ssim', 'psnr', 'n_vox_real', 'n_vox_syn']
+              'cw_ssim', 'psnr', 'n_vox_real', 'n_vox_syn', 'd_vox',
+              'vol_mm3_real', 'vol_mm3_syn', 'vol_ratio']
     with open(out_csv, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
@@ -250,8 +289,8 @@ def report(rows, out_csv):
 
     print(f'\nPer-structure metrics written to {out_csv}')
     print('\nPer structure (failures counted as dice 0, which is the honest number):')
-    print(f'{"structure":14s} {"dice":>16s} {"centroid mm":>16s} {"ssim":>8s} '
-          f'{"cw_ssim":>8s} {"psnr":>7s}  {"n":>3s} {"fail":>4s}')
+    print(f'{"structure":14s} {"dice":>16s} {"centroid mm":>16s} {"vol_ratio":>16s} '
+          f'{"ssim":>8s} {"cw_ssim":>8s} {"psnr":>7s}  {"n":>3s} {"fail":>4s}')
 
     for group, members in BILATERAL_GROUPS.items():
         names = {STRUCTURE_NAMES[m] for m in members}
@@ -265,10 +304,12 @@ def report(rows, out_csv):
         dvals = [0.0 if r['seg_status'] == 'missing_syn' else r['dice'] for r in sel]
         dm, ds = float(np.mean(dvals)), float(np.std(dvals))
         cm, cs, _ = stat(scored, 'centroid_mm')
+        vm, vs, _ = stat(scored, 'vol_ratio')
         sm, _, _ = stat(scored, 'ssim')
         wm, _, _ = stat(scored, 'cw_ssim')
         pm, _, _ = stat(scored, 'psnr')
         print(f'{group:14s} {dm:7.3f} +/-{ds:5.3f} {cm:8.2f} +/-{cs:5.2f} '
+              f'{vm:8.3f} +/-{vs:5.3f} '
               f'{sm:8.3f} {wm:8.3f} {pm:7.2f}  {len(sel):3d} {nfail:4d}')
 
     ok = [r for r in rows if r['seg_status'] == 'ok']
@@ -278,6 +319,15 @@ def report(rows, out_csv):
           f'(gap {wm - sm:+.3f})')
     print('  A positive gap is the share of SSIM loss attributable to small')
     print('  misalignment rather than to synthesis error.')
+
+    vr = [r['vol_ratio'] for r in ok
+          if isinstance(r['vol_ratio'], float) and np.isfinite(r['vol_ratio'])]
+    if vr:
+        under = sum(1 for v in vr if v < 1.0)
+        print(f'\nvol_ratio over all scored structures: {np.mean(vr):.3f} '
+              f'(median {np.median(vr):.3f}, {under}/{len(vr)} under-segmented)')
+        print('  A systematic bias one side of 1.00 is a size error the model can')
+        print('  be trained out of; scatter centred on 1.00 is segmentation noise.')
 
     counts = {}
     for r in rows:

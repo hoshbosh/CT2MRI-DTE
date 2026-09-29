@@ -10,7 +10,7 @@ from Register import Registers
 from model.BrownianBridge.BrownianBridgeModel import BrownianBridgeModel
 from runners.DiffusionBasedModelRunners.DiffusionBaseRunner import DiffusionBaseRunner
 from runners.utils import *
-from runners.eval import calcul_metrics, save_exp_result
+from runners.eval import calcul_metrics, save_exp_result, foreground_mask
 
 import nibabel as nib
 from collections import defaultdict
@@ -18,6 +18,36 @@ import pandas as pd
 
 import time
 import wandb
+
+
+def unpack_batch(batch):
+    """(x, x_name), (x_cond, x_cond_name), context, labels -- with explicit arity.
+
+    Every call site used to spell this as a starred rest-capture followed by
+    taking element [0], which silently discarded anything past the third item.
+    That was harmless while batches were 3-tuples and became a real hazard once
+    the label-carrying dataset started emitting a 4th: the label map would have
+    been dropped with no error, and a structure-weighted training run would have
+    completed unweighted while reporting a clean negative result.
+
+    `labels` is None for the 2- and 3-tuple datasets. Sampling paths legitimately
+    ignore it -- there is no loss to weight -- but they now do so visibly.
+    """
+    if len(batch) == 4:
+        (x, x_name), (x_cond, x_cond_name), context, labels = batch
+    elif len(batch) == 3:
+        (x, x_name), (x_cond, x_cond_name), context = batch
+        labels = None
+    elif len(batch) == 2:
+        (x, x_name), (x_cond, x_cond_name) = batch
+        context, labels = None, None
+    else:
+        raise ValueError(
+            f"batch has {len(batch)} elements; expected 2 (image pair), "
+            f"3 (+ histogram context) or 4 (+ label map)."
+        )
+    return (x, x_name), (x_cond, x_cond_name), context, labels
+
 
 @Registers.runners.register_with_name('BBDMRunner')
 class BBDMRunner(DiffusionBaseRunner):
@@ -63,13 +93,30 @@ class BBDMRunner(DiffusionBaseRunner):
         print("Trainable Number of parameter: %.2fM" % (trainable_num / 1e6))
 
     def initialize_optimizer_scheduler(self, net, config):
-        optimizer = get_optimizer(config.model.BB.optimizer, net.get_parameters())
-        #verbose=True,
+        optim_config = config.model.BB.optimizer
+        cross_attn_lr = getattr(optim_config, 'cross_attn_lr', None)
+
+        if cross_attn_lr is not None:
+            param_groups = net.get_parameter_groups(
+                base_lr=optim_config.lr,
+                cross_attn_lr=cross_attn_lr,
+            )
+            print(f"Using separate LRs: base={optim_config.lr}, cross_attn={cross_attn_lr}")
+            print(f"  Base params: {sum(p.numel() for p in param_groups[0]['params'])/ 1e6:.2f}M")
+            print(f"  Cross-attn params: {sum(p.numel() for p in param_groups[1]['params'])/ 1e6:.2f}M")
+            optimizer = torch.optim.Adam(
+                param_groups,
+                lr=optim_config.lr,
+                weight_decay=optim_config.weight_decay,
+                betas=(optim_config.beta1, 0.999),
+            )
+        else:
+            optimizer = get_optimizer(optim_config, net.get_parameters())
+
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer,
                                                                mode='min',
                                                                threshold_mode='rel',
-                                                               **vars(config.model.BB.lr_scheduler)
-)
+                                                               **vars(config.model.BB.lr_scheduler))
         return [optimizer], [scheduler]
 
     @torch.no_grad()
@@ -103,8 +150,7 @@ class BBDMRunner(DiffusionBaseRunner):
         max_batch_num = 30000 // self.config.data.train.batch_size
 
         def calc_mean(batch, total_ori_mean=None, total_cond_mean=None):
-            (x, x_name), (x_cond, x_cond_name), *context= batch
-            context = context[0] if context else None
+            (x, x_name), (x_cond, x_cond_name), context, _ = unpack_batch(batch)
 
             x = x.to(self.config.training.device[0])
             x_cond = x_cond.to(self.config.training.device[0])
@@ -119,8 +165,7 @@ class BBDMRunner(DiffusionBaseRunner):
             return total_ori_mean, total_cond_mean
 
         def calc_var(batch, ori_latent_mean=None, cond_latent_mean=None, total_ori_var=None, total_cond_var=None):
-            (x, x_name), (x_cond, x_cond_name), *context= batch
-            context = context[0] if context else None
+            (x, x_name), (x_cond, x_cond_name), context, _ = unpack_batch(batch)
             
             x = x.to(self.config.training.device[0])
             x_cond = x_cond.to(self.config.training.device[0])
@@ -167,24 +212,40 @@ class BBDMRunner(DiffusionBaseRunner):
         print(self.net.cond_latent_std)
 
     def loss_fn(self, net, batch, epoch, step, opt_idx=0, stage='train', write=True):
-        (x, x_name), (x_cond, x_cond_name), *context = batch
-        context = context[0] if context else None
+        (x, x_name), (x_cond, x_cond_name), context, labels = unpack_batch(batch)
 
         x = x.to(self.config.training.device[0], non_blocking=True)
         x_cond = x_cond.to(self.config.training.device[0], non_blocking=True)
         if context is not None:
             context = context.to(self.config.training.device[0], non_blocking=True)
+        if labels is not None:
+            labels = labels.to(self.config.training.device[0], non_blocking=True)
 
-        loss, additional_info = net(x, x_cond, context=context)
+        loss, additional_info = net(x, x_cond, context=context, labels=labels)
         if write:
             self.writer.add_scalar(f'loss/{stage}', loss, step)
+            # Also to tensorboard, not just wandb: wandb runs offline when the
+            # node has no key, and this scalar is how a null result gets told
+            # apart from "the weighting never engaged".
+            if 'deepgray_frac' in additional_info:
+                self.writer.add_scalar(f'deepgray_frac/{stage}',
+                                       additional_info['deepgray_frac'], step)
             try:
-                wandb.log({f"loss/{stage}": loss}, step=step)
+                log_dict = {f"loss/{stage}": loss}
+                if 'recloss_l1' in additional_info:
+                    log_dict[f"loss_l1/{stage}"] = additional_info['recloss_l1']
+                if 'perceptual_loss' in additional_info:
+                    log_dict[f"loss_perceptual/{stage}"] = additional_info['perceptual_loss']
+                if 'frequency_loss' in additional_info:
+                    log_dict[f"loss_frequency/{stage}"] = additional_info['frequency_loss']
+                if 'deepgray_frac' in additional_info:
+                    log_dict[f"deepgray_frac/{stage}"] = additional_info['deepgray_frac']
+                wandb.log(log_dict, step=step)
             except:
                 print(f'Could not log loss to wandb')
             if additional_info.__contains__('recloss_noise'):
                 self.writer.add_scalar(f'recloss_noise/{stage}', additional_info['recloss_noise'], step)
-                        
+
             if additional_info.__contains__('recloss_xy'):
                 self.writer.add_scalar(f'recloss_xy/{stage}', additional_info['recloss_xy'], step)
         return loss
@@ -193,8 +254,8 @@ class BBDMRunner(DiffusionBaseRunner):
     def sample(self, net, batch, sample_path, stage='train'):
         sample_path = make_dir(os.path.join(sample_path, f'{stage}_sample'))
 
-        (x, x_name), (x_cond, x_cond_name), *context = batch
-        context = context[0] if context else None
+        # Labels carry no information for sampling; dropped deliberately.
+        (x, x_name), (x_cond, x_cond_name), context, _ = unpack_batch(batch)
 
         batch_size = x.shape[0] if x.shape[0] < 4 else 4
 
@@ -262,6 +323,21 @@ class BBDMRunner(DiffusionBaseRunner):
         elif "average" in dataset_type:
             sample_path += '_average'
 
+        # Uncertainty quantification: draw `uq_samples` stochastic samples per subject and
+        # report their per-voxel mean (ensemble prediction) and std (predictive uncertainty).
+        # Sampling is only stochastic when eta > 0 (see p_sample: sigma_t scales with eta),
+        # so at eta == 0 every member would be bit-identical and the std map would be zero.
+        uq_samples = getattr(self.config.model.BB.params, 'uq_samples', 1) or 1
+        if uq_samples > 1:
+            if self.config.model.BB.params.eta <= 0:
+                raise ValueError(
+                    f"uq_samples={uq_samples} requires ddim_eta > 0; got eta={self.config.model.BB.params.eta}. "
+                    "At eta=0 sampling is deterministic and all members would be identical."
+                )
+            # Deliberately not keyed by N: members are cached per index, so a later run with
+            # a larger uq_samples reuses the members already on disk and only adds the new ones.
+            sample_path += '_uq'
+
         print(f"sample_path: {sample_path}")
         os.makedirs(sample_path, exist_ok=True)
 
@@ -277,8 +353,14 @@ class BBDMRunner(DiffusionBaseRunner):
             gt_dict[pid].append(gt_slice)
 
         metrics_dict = defaultdict(dict)
+        single_metrics_dict = defaultdict(dict)
         for pid in tqdm(batch_dict.keys()):
-            out_path = os.path.join(sample_path, f'{pid}.nii')
+            # One cached .nii per ensemble member, so a job killed mid-run resumes at
+            # member granularity rather than redoing the whole subject.
+            if uq_samples > 1:
+                member_paths = [os.path.join(sample_path, f'{pid}_s{k}.nii') for k in range(uq_samples)]
+            else:
+                member_paths = [os.path.join(sample_path, f'{pid}.nii')]
 
             # Build ground truth volume from dataset slices
             gt_slices = np.stack(gt_dict[pid], axis=0)  # [num_slices, H, W]
@@ -287,34 +369,68 @@ class BBDMRunner(DiffusionBaseRunner):
             gt_slices = np.clip(gt_slices, 0, 1)
             gt_volume = np.transpose(gt_slices, (1, 2, 0))  # [H, W, num_slices]
 
-            # Always regenerate (don't use cached .nii from previous runs)
+            batch_gpu = None
+            members = []
+            for k, member_path in enumerate(member_paths):
+                if os.path.exists(member_path):
+                    print(f'resuming: {pid} member {k} (loading cached .nii)')
+                    members.append(nib.load(member_path).get_fdata())
+                    continue
 
-            test_batch = default_collate(batch_dict[pid])
-            (x, x_name), (x_cond, x_cond_name), *context = test_batch
-            context = context[0] if context else None
-            x_cond = x_cond.to(self.config.training.device[0], non_blocking=True)
-            if context is not None:
-                context = context.to(self.config.training.device[0], non_blocking=True)
+                # Conditioning is identical across members; only the sampling noise differs.
+                if batch_gpu is None:
+                    test_batch = default_collate(batch_dict[pid])
+                    (x, x_name), (x_cond, x_cond_name), context, _ = unpack_batch(test_batch)
+                    x_cond = x_cond.to(self.config.training.device[0], non_blocking=True)
+                    if context is not None:
+                        context = context.to(self.config.training.device[0], non_blocking=True)
+                    batch_gpu = (x, x_cond, x_cond_name, context)
 
-            sample = net.sample(x, x_cond, x_cond_name, context=context, clip_denoised=False, path=sample_path, save=False, config=self.config, device=self.config.training.device[0])
-            sample = sample[:, mid_slice].detach().clone().cpu().mul_(0.5).add_(0.5).clamp_(0, 1.)
+                x, x_cond, x_cond_name, context = batch_gpu
+                sample = net.sample(x, x_cond, x_cond_name, context=context, clip_denoised=False, path=sample_path, save=False, config=self.config, device=self.config.training.device[0])
+                sample = sample[:, mid_slice].detach().clone().cpu().mul_(0.5).add_(0.5).clamp_(0, 1.)
 
-            # Save synthetic volume as NIfTI
-            syn_volume = sample.numpy().transpose(1, 2, 0)  # [H, W, num_slices]
-            syn_nii = nib.Nifti1Image(syn_volume, np.eye(4))
-            nib.save(syn_nii, out_path)
-            print(f'saved_id: {pid}')
+                member = sample.numpy().transpose(1, 2, 0)  # [H, W, num_slices]
+                nib.save(nib.Nifti1Image(member, np.eye(4)), member_path)
+                members.append(member)
+                print(f'saved_id: {pid} member {k}')
 
-            syn_img = syn_volume
+            if uq_samples > 1:
+                stack = np.stack(members, axis=0)  # [N, H, W, num_slices]
+                syn_img = stack.mean(axis=0)       # ensemble prediction
+                unc_img = stack.std(axis=0)        # per-voxel predictive std
+                nib.save(nib.Nifti1Image(syn_img, np.eye(4)), os.path.join(sample_path, f'{pid}_mean.nii'))
+                nib.save(nib.Nifti1Image(unc_img, np.eye(4)), os.path.join(sample_path, f'{pid}_std.nii'))
+            else:
+                syn_img = members[0]
+                unc_img = None
+
             print(f"  syn range: [{syn_img.min():.4f}, {syn_img.max():.4f}], mean: {syn_img.mean():.4f}")
             print(f"  gt  range: [{gt_volume.min():.4f}, {gt_volume.max():.4f}], mean: {gt_volume.mean():.4f}")
-            calcul_metrics(metrics_dict, pid, syn_img, gt_volume)
+            mask = foreground_mask(gt_volume)
+            calcul_metrics(metrics_dict, pid, syn_img, gt_volume, mask=mask, device=self.config.training.device[0])
+
+            if unc_img is not None:
+                metrics_dict[pid]['unc_mean'] = float(unc_img.mean())
+                metrics_dict[pid]['unc_mean_mask'] = float(unc_img[mask].mean()) if mask.any() else np.nan
+                # Member 0 scored on its own, so the ensemble gain can be separated from
+                # the effect of moving eta off 0 to make sampling stochastic at all.
+                calcul_metrics(single_metrics_dict, pid, members[0], gt_volume, mask=mask, device=self.config.training.device[0])
 
         df = pd.DataFrame.from_dict(metrics_dict, orient='index')
         means = df.mean()
         df.loc['mean'] = means
 
         df.to_csv(os.path.join(sample_path, 'results.csv'), index_label='pa_id')
+
+        if single_metrics_dict:
+            df_single = pd.DataFrame.from_dict(single_metrics_dict, orient='index')
+            df_single.loc['mean'] = df_single.mean()
+            df_single.to_csv(os.path.join(sample_path, 'results_single_member.csv'), index_label='pa_id')
+            print("\nensemble vs single member (mean over subjects):")
+            for m in ['ssim', 'ssim_mask', 'psnr', 'psnr_mask', 'lpips', 'nrmse']:
+                print(f"  {m:10s} ensemble={means[m]:.4f}  single={df_single.loc['mean', m]:.4f}")
+            print(f"  predictive std: overall={means['unc_mean']:.4f}  in-brain={means['unc_mean_mask']:.4f}")
 
         results_file = os.path.join(sample_path, 'test_results.csv')
         save_exp_result(results_file, self.config, means)

@@ -702,6 +702,14 @@ class UNetModel(nn.Module):
             print("Total Number of parameter: %.2fM" % (total_num / 1e6))
             print("Trainable Number of parameter: %.2fM" % (total_num / 1e6))
 
+    def get_cross_attention_params(self):
+        """Return parameters from all SpatialTransformer (cross-attention) modules."""
+        params = []
+        for module in self.modules():
+            if isinstance(module, SpatialTransformer):
+                params.extend(module.parameters())
+        return params
+
     def convert_to_fp16(self):
         """
         Convert the torso of the model to float16.

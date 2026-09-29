@@ -1,0 +1,18 @@
+# Per-subject SynthSeg provenance and structure exclusions, decided from the
+# Phase 1 QC pass (volume outliers + overlay inspection + a --robust re-run).
+#
+# synthseg_mode       which SynthSeg pass supplies this subject's labels.
+#                     Phase 2 MUST segment the synthetic MR with the same mode,
+#                     or Dice measures model disagreement, not synthesis error.
+# excluded_structures compact structure names withheld from the structure-weighted
+#                     loss (Phase 3) and per-structure metrics (Phase 2). The
+#                     subject's CT/MR image pair is still used for training.
+#
+# Any subject absent from this file uses mode=default with no exclusions.
+subject,synthseg_mode,excluded_structures,reason
+1BA076,robust,amygdala_L;amygdala_R,right amygdala absent in the default pass; --robust recovers it (0 -> 781 vox) but total is 0.64x cohort with 2:1 L/R asymmetry
+1BB189,robust,,default pass gave a 615-vox right amygdala; --robust recovers it to 1789 vox and 0.94x cohort with clean L/R symmetry -- fully rescued, no exclusion
+1BC001,default,thalamus_L;thalamus_R,thalamus 1.87x cohort median and unchanged by --robust; overlay shows the label extending across abnormal tissue around enlarged ventricles
+1BB003,default,thalamus_L;thalamus_R,thalamus 1.60x cohort median and unchanged by --robust; overlay shows the label engulfing an intrathalamic lesion
+1BB028,default,amygdala_L;amygdala_R,amygdala 1.39x cohort median; --robust reduces but does not normalise it (5875 -> 5133)
+1BA141,default,amygdala_L;amygdala_R,amygdala 1.37x cohort median -- same magnitude as 1BB028 (1.39x) and the wrong direction for a brain with this much ventricular enlargement and cortical atrophy; surfaced only after 1BB028 was held out

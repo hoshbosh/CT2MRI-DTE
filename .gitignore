@@ -3,3 +3,7 @@
 *wandb*
 *api*
 ct2mri_*.sh
+
+# Generated QC figures from generate_total_hist_global.py (visualize_histogram);
+# ~50MB of PNGs that made an HTTP push time out. Regenerate, do not version.
+datasets/MR_hists_global_*/

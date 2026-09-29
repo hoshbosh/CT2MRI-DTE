@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import math
 import time
 import shutil
 
@@ -81,9 +82,11 @@ class BaseRunner(ABC):
             self.net = torch.compile(self.net)
             print("Model compiled successfully.")
 
-        # wandb model watching (gradients + parameters) — only on rank 0
+        # wandb model watching — parameters only. Logging gradients via wandb.watch
+        # under AMP captures scaler-scaled grads (often Inf/NaN before unscale_),
+        # which poisons the wandb run. Post-clip grad norms are logged manually below.
         if wandb.run is not None:
-            wandb.watch(self._uncompiled_net, log='all', log_freq=500)
+            wandb.watch(self._uncompiled_net, log='parameters', log_freq=500)
 
     # save configuration file
     def save_config(self):
@@ -115,11 +118,54 @@ class BaseRunner(ABC):
         return net, optimizer, scheduler
 
     # load model, EMA, optimizer, scheduler from checkpoint
+    def find_latest_checkpoint(self):
+        """Newest (model, optim_sche, epoch) written by this run, or None if it hasn't checkpointed yet.
+
+        Pairs are only considered complete when both halves are present, so a job killed
+        partway through torch.save doesn't leave us resuming weights without their optimizer.
+        """
+        ckpt_dir = self.config.result.ckpt_path
+        if not os.path.isdir(ckpt_dir):
+            return None
+
+        best_epoch = -1
+        for fname in os.listdir(ckpt_dir):
+            if not (fname.startswith('latest_model_') and fname.endswith('.pth')):
+                continue
+            stem = fname[len('latest_model_'):-len('.pth')]
+            if not stem.isdigit():
+                continue
+            epoch = int(stem)
+            optim_path = os.path.join(ckpt_dir, f'latest_optim_sche_{epoch}.pth')
+            if epoch > best_epoch and os.path.exists(optim_path):
+                best_epoch = epoch
+
+        if best_epoch < 0:
+            return None
+        return (os.path.join(ckpt_dir, f'latest_model_{best_epoch}.pth'),
+                os.path.join(ckpt_dir, f'latest_optim_sche_{best_epoch}.pth'),
+                best_epoch)
+
     def load_model_from_checkpoint(self):
         model_states = None
-        if self.config.model.__contains__('model_load_path') and self.config.model.model_load_path is not None:
-            print(f"load model {self.config.model.model_name} from {self.config.model.model_load_path}")
-            model_states = torch.load(self.config.model.model_load_path, map_location='cpu')
+
+        load_path = self.config.model.model_load_path if self.config.model.__contains__('model_load_path') else None
+        optim_load_path = self.config.model.optim_sche_load_path if self.config.model.__contains__('optim_sche_load_path') else None
+
+        # Auto-resume takes precedence over model_load_path while training. The cluster
+        # kills jobs mid-run, and without this a restart would silently rewind to the
+        # tier's starting weights and redo everything already computed. Note this also
+        # overrides the deliberate "fresh optimizer" setup used at tier boundaries --
+        # correctly so, since that only applies before the first checkpoint exists.
+        if self.config.args.train and not getattr(self.config.args, 'no_auto_resume', False):
+            latest = self.find_latest_checkpoint()
+            if latest is not None:
+                load_path, optim_load_path, resumed_epoch = latest
+                print(f"auto-resume: resuming from epoch {resumed_epoch} at {load_path}")
+
+        if load_path is not None:
+            print(f"load model {self.config.model.model_name} from {load_path}")
+            model_states = torch.load(load_path, map_location='cpu')
 
             self.global_epoch = model_states['epoch']
             self.global_step = model_states['step']
@@ -154,8 +200,8 @@ class BaseRunner(ABC):
 
             # load optimizer and scheduler
             if self.config.args.train:
-                if self.config.model.__contains__('optim_sche_load_path') and self.config.model.optim_sche_load_path is not None:
-                    optimizer_scheduler_states = torch.load(self.config.model.optim_sche_load_path, map_location='cpu')
+                if optim_load_path is not None:
+                    optimizer_scheduler_states = torch.load(optim_load_path, map_location='cpu')
                     for i in range(len(self.optimizer)):
                         self.optimizer[i].load_state_dict(optimizer_scheduler_states['optimizer'][i])
 
@@ -271,16 +317,17 @@ class BaseRunner(ABC):
         average_loss = loss_sum / step
         self.writer.add_scalar(f'val_epoch/loss', average_loss, epoch)
         try:
-            wandb.log({f'val_epoch/loss': average_loss}, step=epoch)
-        except:
-            print('Could not log loss/val_epoch to wandb')
+            # Must use global_step (not epoch) so wandb's monotonic-step contract holds.
+            wandb.log({'val_epoch/loss': average_loss, 'val_epoch/epoch': epoch}, step=self.global_step)
+        except Exception as e:
+            print(f'Could not log loss/val_epoch to wandb: {e!r}')
         if len(self.optimizer) > 1:
             average_dloss = dloss_sum / step
             self.writer.add_scalar(f'val_dloss_epoch/loss', average_dloss, epoch)
             try:
-                wandb.log({f'loss/val_dloss_epoch': average_dloss}, step=epoch)
-            except:
-                print('Could not log loss/val_dloss_epoch to wandb')
+                wandb.log({'loss/val_dloss_epoch': average_dloss}, step=self.global_step)
+            except Exception as e:
+                print(f'Could not log loss/val_dloss_epoch to wandb: {e!r}')
 
         self.restore_ema()
         return average_loss
@@ -385,9 +432,10 @@ class BaseRunner(ABC):
             # test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
             train_loader = DataLoader(train_dataset,
                                       batch_size=self.config.data.train.batch_size,
-                                      num_workers=4,
+                                      num_workers=2,
                                       pin_memory=True,
                                       persistent_workers=True,
+                                      prefetch_factor=2,
                                       drop_last=True,
                                       sampler=train_sampler)
             val_loader = DataLoader(val_dataset,
@@ -395,6 +443,7 @@ class BaseRunner(ABC):
                                     num_workers=2,
                                     pin_memory=True,
                                     persistent_workers=True,
+                                    prefetch_factor=2,
                                     drop_last=True,
                                     sampler=val_sampler)
             # test_loader = DataLoader(test_dataset,
@@ -406,9 +455,10 @@ class BaseRunner(ABC):
             train_loader = DataLoader(train_dataset,
                                       batch_size=self.config.data.train.batch_size,
                                       shuffle=self.config.data.train.shuffle,
-                                      num_workers=4,
+                                      num_workers=2,
                                       pin_memory=True,
                                       persistent_workers=True,
+                                      prefetch_factor=2,
                                       drop_last=False)
             val_loader = DataLoader(val_dataset,
                                     batch_size=self.config.data.val.batch_size,
@@ -416,6 +466,7 @@ class BaseRunner(ABC):
                                     num_workers=2,
                                     pin_memory=True,
                                     persistent_workers=True,
+                                    prefetch_factor=2,
                                     drop_last=False)
             # test_loader = DataLoader(test_dataset,
             #                          batch_size=self.config.data.test.batch_size,
@@ -445,6 +496,7 @@ class BaseRunner(ABC):
                 start_time = time.time()
                 val_iter = iter(val_loader)
                 grad_norm = None
+                grad_norm_pre_clip = None
                 for train_batch in pbar:
                     self.global_step += 1
                     self.net.train()
@@ -462,7 +514,16 @@ class BaseRunner(ABC):
                         scaler.scale(loss).backward()
                         if self.global_step % accumulate_grad_batches == 0:
                             scaler.unscale_(self.optimizer[i])
-                            grad_norm = torch.nn.utils.clip_grad_norm_(self._uncompiled_net.parameters(), max_norm=1.0)
+                            # Compute pre-clip gradient norm then clip
+                            clip_max_norm = getattr(self.config.training, 'grad_clip_max_norm', 1.0)
+                            params = [p for p in self._uncompiled_net.parameters() if p.grad is not None]
+                            if params:
+                                grad_norm_pre_clip = torch.nn.utils.get_total_norm(
+                                    [p.grad for p in params], norm_type=2.0
+                                ) if hasattr(torch.nn.utils, 'get_total_norm') else torch.sqrt(
+                                    sum(p.grad.detach().float().pow(2).sum() for p in params)
+                                )
+                            grad_norm = torch.nn.utils.clip_grad_norm_(self._uncompiled_net.parameters(), max_norm=clip_max_norm)
                             scaler.step(self.optimizer[i])
                             self.optimizer[i].zero_grad(set_to_none=True)
                             if self.scheduler is not None:
@@ -475,16 +536,33 @@ class BaseRunner(ABC):
                     # wandb logging: LR, GPU memory, throughput, gradient norm (rank 0 only)
                     if self.is_main_process and self.global_step % 100 == 0:
                         try:
+                            def _finite(t):
+                                # Skip NaN/Inf so we don't poison wandb panels.
+                                if t is None:
+                                    return None
+                                v = t.item() if hasattr(t, 'item') else float(t)
+                                return v if math.isfinite(v) else None
                             log_dict = {
-                                'train/grad_norm': grad_norm.item() if grad_norm is not None else 0,
-                                'train/lr': self.optimizer[0].param_groups[0]['lr'],
+                                'train/lr_base': self.optimizer[0].param_groups[0]['lr'],
+                                'train/lr_cross_attn': self.optimizer[0].param_groups[-1]['lr'] if len(self.optimizer[0].param_groups) > 1 else self.optimizer[0].param_groups[0]['lr'],
                                 'train/gpu_mem_allocated_mb': torch.cuda.memory_allocated() / 1e6,
                                 'train/gpu_mem_reserved_mb': torch.cuda.memory_reserved() / 1e6,
                                 'train/epoch': epoch + 1,
+                                # AMP loss scale: monotonically halving across training
+                                # means scaler.step is being skipped every batch (silent
+                                # NaN/Inf grads). A healthy run hovers near the initial
+                                # scale (e.g. 65536) and only drops occasionally.
+                                'train/amp_loss_scale': scaler.get_scale(),
                             }
+                            gpc = _finite(grad_norm_pre_clip)
+                            if gpc is not None:
+                                log_dict['train/grad_norm_pre_clip'] = gpc
+                            gp = _finite(grad_norm)
+                            if gp is not None:
+                                log_dict['train/grad_norm_post_clip'] = gp
                             wandb.log(log_dict, step=self.global_step)
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f'Could not log train metrics to wandb: {e!r}')
 
                     if self.use_ema and self.global_step % (self.update_ema_interval*accumulate_grad_batches) == 0:
                         self.step_ema()

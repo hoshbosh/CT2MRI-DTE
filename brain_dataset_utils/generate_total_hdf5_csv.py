@@ -5,6 +5,10 @@ import os
 import numpy as np
 import nibabel as nib
 import pandas as pd
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from brain_dataset_utils.geometry import GeometryParams
 
 def make_transpose_dict(axcodes):
     dim_match = {} # Nifti uses RAH+ #
@@ -48,6 +52,12 @@ def transform_sagittal(vol, coronal2sagittal=True):
 
 
 def filter_blank_slices_thick(CT_data, MR_data, threshold=50):
+    """Drop slices that are essentially empty in the CT.
+
+    Returns the retained-slice boolean mask as well, so that any additional
+    volume for the same subject (e.g. a label map) is filtered by exactly the
+    same selection rather than by a recomputed one.
+    """
 
     # Get indices of all slices with more than threshold labels/pixels
     binaray_label = np.where(CT_data > 1e-15, 1, 0)
@@ -58,12 +68,12 @@ def filter_blank_slices_thick(CT_data, MR_data, threshold=50):
     MR_data = MR_data[:, :, select_slices]
     print(CT_data.shape)
     # print(select_slices)
-    
+
     true_indices = np.where(select_slices == True)[0]
     first_true_index = true_indices[0] if true_indices.size > 0 else None
     last_true_index = true_indices[-1] if true_indices.size > 0 else None
     print(f"{first_true_index} ~ {last_true_index}")
-    return CT_data, MR_data
+    return CT_data, MR_data, select_slices
 
 
 def transpose_LPS_to_ITKSNAP_position(np_data, plane):
@@ -94,8 +104,15 @@ def create_hdf5_dataset(args):
         
     CT_dataset = np.ndarray(shape=(args.height, args.width, 0), dtype=np.float32)
     MR_dataset = np.ndarray(shape=(args.height, args.width, 0), dtype=np.float32)
-    index_dataset = np.ndarray(shape=(0), dtype=np.uint8)
-    max_index_dataset = np.ndarray(shape=(0), dtype=np.uint8)
+    # Labels are optional so every pre-existing config keeps working unchanged.
+    want_labels = bool(args.SEG_name)
+    LABEL_dataset = np.ndarray(shape=(args.height, args.width, 0), dtype=np.uint8)
+    # int32, not uint8: a subject with >255 retained slices used to have its
+    # index/subject entries truncated while all of its slices were still
+    # appended to the image arrays, desynchronising every subsequent subject.
+    index_dataset = np.ndarray(shape=(0), dtype=np.int32)
+    max_index_dataset = np.ndarray(shape=(0), dtype=np.int32)
+    spacing_rows = []
     subjects = []
 
     for idx, current_subject in enumerate(subject_dir):
@@ -116,20 +133,54 @@ def create_hdf5_dataset(args):
         CT_data = transpose_LPS_to_ITKSNAP_position(CT_data, args.plane)
         MR_data = transpose_LPS_to_ITKSNAP_position(MR_data, args.plane)
 
-        CT_data, MR_data = filter_blank_slices_thick(CT_data, MR_data, threshold=50)
+        if want_labels:
+            seg_path = os.path.join(current_subject, args.SEG_name)
+            if not os.path.exists(seg_path):
+                raise FileNotFoundError(
+                    f"{current_subject}: --SEG_name given but {seg_path} is missing. "
+                    "Run brain_dataset_utils/make_labels.py first."
+                )
+            SEG_data = np.asanyarray(nib.load(seg_path).dataobj).astype(np.uint8)
+            SEG_data = transpose_LPS_to_ITKSNAP_position(SEG_data, args.plane)
+            if SEG_data.shape != MR_data.shape:
+                raise ValueError(
+                    f"{current_subject}: label volume {SEG_data.shape} does not match "
+                    f"MR {MR_data.shape}; labels were not built on the training grid"
+                )
+        else:
+            SEG_data = None
+
+        # One filter, one selection: the label map is filtered by the same mask
+        # the images are, never by a recomputed one.
+        CT_data, MR_data, select_slices = filter_blank_slices_thick(CT_data, MR_data, threshold=50)
+        if SEG_data is not None:
+            SEG_data = SEG_data[:, :, select_slices]
             
         # # Append finally processed images to arrays
         CT_dataset = np.append(CT_dataset, CT_data, axis=2)
         MR_dataset = np.append(MR_dataset, MR_data, axis=2)
+        if SEG_data is not None:
+            LABEL_dataset = np.append(LABEL_dataset, SEG_data, axis=2)
         slices = CT_data.shape[2]
-        if CT_data.shape[2] > 255:
-            print(f"Warning: Number of slices {CT_data.shape[2]} exceeds 255, truncating max_index_dataset to 255.")
-            slices = 255
-        index_dataset = np.append(index_dataset, np.arange(slices, dtype=np.uint8), axis=0)
-        max_index_dataset = np.append(max_index_dataset, np.full(slices, slices-1, dtype=np.uint8), axis=0)
+        index_dataset = np.append(index_dataset, np.arange(slices, dtype=np.int32), axis=0)
+        max_index_dataset = np.append(max_index_dataset, np.full(slices, slices-1, dtype=np.int32), axis=0)
         sub_name = current_subject.split("/")[-1]
         subjects.extend([sub_name.encode("ascii", "ignore")] * slices)
         # subjects.append(sub_name.encode("ascii", "ignore"))
+
+        # True mm/voxel on the training grid. The saved NIfTI affine does not
+        # reflect the in-plane resize, so spacing comes from the geometry record.
+        geom_path = os.path.join(current_subject, "geometry.json")
+        if os.path.exists(geom_path):
+            spacing = GeometryParams.from_json(geom_path).spacing_for_plane(args.plane)
+        elif want_labels:
+            raise FileNotFoundError(
+                f"{current_subject}: geometry.json missing, so voxel spacing is unknown "
+                "and structure centroids could not be reported in mm."
+            )
+        else:
+            spacing = [np.nan, np.nan, np.nan]
+        spacing_rows.extend([spacing] * slices)
 
         end = time.time() - start
 
@@ -138,13 +189,29 @@ def create_hdf5_dataset(args):
         if args.debugging and idx == 2:
             break
 
-    index_dataset = np.transpose(np.vstack((index_dataset, max_index_dataset))).astype(np.uint8)
+    index_dataset = np.transpose(np.vstack((index_dataset, max_index_dataset))).astype(np.int32)
+    spacing_dataset = np.asarray(spacing_rows, dtype=np.float32)
+
+    # The desynchronisation this dtype change fixes was silent before; assert it.
+    if CT_dataset.shape[2] != index_dataset.shape[0]:
+        raise RuntimeError(
+            f"slice/index desynchronisation: {CT_dataset.shape[2]} image slices vs "
+            f"{index_dataset.shape[0]} index rows"
+        )
+    if want_labels and LABEL_dataset.shape[2] != CT_dataset.shape[2]:
+        raise RuntimeError(
+            f"label/image desynchronisation: {LABEL_dataset.shape[2]} label slices vs "
+            f"{CT_dataset.shape[2]} image slices"
+        )
 
     # # Write the hdf5 file
     with h5py.File(args.hdf5_name, "w") as hf:
         hf.create_dataset('CT_dataset', data=CT_dataset, compression='gzip')
         hf.create_dataset('MR_dataset', data=MR_dataset, compression='gzip')
         hf.create_dataset('index_dataset', data=index_dataset, compression='gzip')
+        hf.create_dataset('spacing_dataset', data=spacing_dataset, compression='gzip')
+        if want_labels:
+            hf.create_dataset('LABEL_dataset', data=LABEL_dataset, compression='gzip')
 
         dt = h5py.special_dtype(vlen=str)
         hf.create_dataset("subject", data=subjects, dtype=dt, compression="gzip")
@@ -153,6 +220,8 @@ def create_hdf5_dataset(args):
     print("Successfully written {} in {:.3f} seconds.".format(args.hdf5_name, end_d))
     print(index_dataset.shape)
     print(CT_dataset.shape)
+    if want_labels:
+        print(f"labels: {LABEL_dataset.shape}")
     print(len(subjects))
 
 def create_folder_hdf5(data_dir, hdf5_name = "output.hdf5", CT_name="CT.nii", MR_name="MR.nii", plane="axial", threshold=50, height=128, width=128, debugging=False):
@@ -183,7 +252,7 @@ def create_folder_hdf5(data_dir, hdf5_name = "output.hdf5", CT_name="CT.nii", MR
         CT_data = transpose_LPS_to_ITKSNAP_position(CT_data, args.plane)
         MR_data = transpose_LPS_to_ITKSNAP_position(MR_data, args.plane)
 
-        CT_data, MR_data = filter_blank_slices_thick(CT_data, MR_data, threshold=50)
+        CT_data, MR_data, _ = filter_blank_slices_thick(CT_data, MR_data, threshold=50)
 
         CT_dataset = np.append(CT_dataset, CT_data, axis=2)
         MR_dataset = np.append(MR_dataset, MR_data, axis=2)
@@ -228,6 +297,8 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', type=str, default="/testsuite", help="Directory with images to load")
     parser.add_argument('--CT_name', type=str)
     parser.add_argument('--MR_name', type=str)
+    parser.add_argument('--SEG_name', type=str, default=None,
+                        help="Label volume filename (e.g. seg.nii). Omit to build without labels.")
 
     args = parser.parse_args()
 

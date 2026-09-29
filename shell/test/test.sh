@@ -1,27 +1,30 @@
 #!/bin/bash
 
 config_name="fine-tune.yaml"
-HW="180"
+HW="256"
 plane="axial"
 ddim_eta=0.0
 
 gpu_ids="0"
 
-exp_name="241213_180_BBDM_axial_DDIM_MR_global_hist_context"
+exp_name="241213_256_BBDM_axial_DDIM_MR_global_hist_context"
 
 # test
-test_epoch="81"
-resume_model="./results/fine-tune_180/fine-tune_180/241213_180_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/top_model_epoch_81.pth"
-resume_optim="./results/fine-tune_180/fine-tune_180/241213_180_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/top_optim_sche_epoch_81.pth"
+test_epoch="117"
+resume_model="/blue/neurology-dept/jlabasbas/new-fine/fine-tune_256/241213_256_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/top_model_epoch_235.pth"
+resume_optim="/blue/neurology-dept/jlabasbas/new-fine/fine-tune_256/241213_256_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/top_optim_sche_epoch_235.pth"
 
 sample_step=200
-inference_type="ISTA_mid" # normal, average, ISTA_average, ISTA_mid
+inference_type="normal" # normal, average, ISTA_average, ISTA_mid
 ISTA_step_size=2
 num_ISTA_step=1
 
+# Eval output tree, relocated 2026-08-08 from $HOME/CT2MRI-DTE/results.
+result_path="/blue/neurology-dept/jlabasbas/8-8-26"
+
 python ./main.py \
     --exp_name $exp_name \
-    --config ./results/fine-tune_180/fine-tune_180/241213_180_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/config_backup.yaml\
+    --config /blue/neurology-dept/jlabasbas/new-fine/fine-tune_256/241213_256_BBDM_axial_DDIM_MR_global_hist_context/checkpoint/config_backup.yaml \
     --sample_to_eval \
     --gpu_ids $gpu_ids \
     --resume_model $resume_model \
@@ -32,6 +35,7 @@ python ./main.py \
     --sample_step $sample_step \
     --inference_type $inference_type \
     --ISTA_step_size $ISTA_step_size \
-    --num_ISTA_step $num_ISTA_step
+    --num_ISTA_step $num_ISTA_step \
+    --result_path $result_path
 
 

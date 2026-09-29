@@ -1,0 +1,139 @@
+# Tier 4 — widened through-plane context (z-context scaling experiment).
+#
+# Identical to Tier 3 (fine-tune.yaml) except the slice window goes 3 -> 7, i.e. the
+# model sees +/-3 neighbouring slices instead of +/-1. Everything else -- losses, mask,
+# schedule, architecture body -- is held fixed so any metric change is attributable to
+# z-context alone.
+#
+# Only the first and last conv change shape (~10K of 493M params); load_model_from_checkpoint
+# reinitialises exactly those and transfers the rest of the Tier 3 backbone.
+#
+# Bridge constraint: q_sample computes (1-m_t)*x0 + m_t*y elementwise, so x0 and y must
+# share a shape. That forces symmetric n->n widening -- 7 slices in, 7 slices out. A
+# 7-in/1-out design would break the bridge.
+runner: "BBDMRunner"
+training:
+  # Warm start is from epoch_472, and start_epoch is restored from the checkpoint,
+  # so this budgets 90 epochs of Tier 4 (Tier 3 needed ~59 to reach its best).
+  n_epochs: 562
+  n_steps: 10000000
+  save_interval: 1
+  sample_interval: 1
+  validation_interval: 1
+  accumulate_grad_batches: 2
+  grad_clip_max_norm: 1.0
+
+testing:
+  clip_denoised: True
+  sample_num: 1
+
+data:
+  dataset_name: 'fine-tune'
+  dataset_type: 'ct2mr_aligned_global_hist_context'
+  dataset_config:
+    dataset_path: '/blue/neurology-dept/jlabasbas/hdf5s/fine'
+    hist_type:  # 'colin', 'avg'
+    plane: 'axial'
+    image_size: 160
+    channels: 7 # Tier 4: was 3. datasets/custom.py derives radius = channels // 2, so this alone widens the window.
+    to_normal: True
+    flip: True
+  train:
+    batch_size: 16
+    shuffle: True
+  val:
+    batch_size: 16
+    shuffle: True
+  test:
+    batch_size: 16
+    shuffle: False
+
+model:
+  model_name: "${date}_${HW}_BBDM_${plane}_DDIM" # part of result path
+  model_type: "BBDM" # LBBDM
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+  # Tier 4: continue from tier3_morphmask epoch_472 (SSIM 0.774 / SSIM_mask 0.533, job 38791459).
+  # Weights only; fresh optimizer. The input/output convs mismatch on shape and are
+  # reinitialised -- expect a "Shape-mismatched keys" line naming exactly two convs at startup.
+  model_load_path: "/blue/neurology-dept/jlabasbas/new-fine/fine-tune_256/241213_256_BBDM_axial_DDIM_MR_tier3_morphmask/checkpoint/top_model_epoch_472.pth"
+  # optim_sche_load_path: left OFF intentionally — fresh optimizer required
+
+  EMA:
+    use_ema: True
+    ema_decay: 0.995
+    update_ema_interval: 8 # step
+    start_ema_step: 30000
+
+  CondStageParams:
+    n_stages: 2
+    in_channels: 7 # Tier 4: was 3
+    out_channels: 7 # Tier 4: was 3
+
+  BB:
+    optimizer:
+      weight_decay: 0.000
+      optimizer: 'Adam'
+      # Tier 4 raises base LR 1.e-6 -> 5.e-6. The two reinitialised convs start from
+      # random and would barely move at 1.e-6, which risks a false negative on the whole
+      # z-context hypothesis. If the backbone destabilises (val loss jumps well above
+      # Tier 3's ~0.066 and stays there past ~10 epochs), drop back to 1.e-6.
+      lr: 5.e-6
+      cross_attn_lr: 5.e-6
+      beta1: 0.9
+
+    lr_scheduler:
+      factor: 0.5
+      patience: 3000
+      threshold: 0.0001
+      cooldown: 3000
+      min_lr: 5.e-7
+
+    params:
+      mt_type: 'linear' # options {'linear', 'sin'}
+      objective: 'grad' # options {'grad', 'noise', 'ysubx'}
+      loss_type: 'l1' # options {'l1', 'l2'}
+      lambda_perceptual: 0.05 # weight for VGG perceptual loss (0 to disable)
+      lambda_ssim: 0.1 # weight for differentiable SSIM aux loss (0 to disable)
+      lambda_frequency: 0.1 # weight for focal frequency (anti-blur) loss (0 to disable); calibrate vs logged loss_frequency magnitude
+      lambda_mask_weight: 3.0 # in-brain pixel weight multiplier (1.0 = disabled); applied to all losses
+      mask_threshold: 0.05 # MR intensity threshold in [0,1] units; matches eval foreground_mask thr
+      mask_close_kernel: 9 # morphological closing kernel size (odd int); fills CSF holes in mask. 0 = disabled.
+
+      skip_sample: True
+      sample_type: 'linear' # options {"linear", "sin"}
+      sample_step: 200
+
+      num_timesteps: 1000 # timesteps
+      eta: 0.0 # DDIM reverse process eta
+      max_var: 1.0 # maximum variance
+
+      inference_type: 'normal' # options {'normal', 'average', 'ISTA_average', 'ISTA_mid'}
+      num_ISTA_step: 1
+      ISTA_step_size: 2.0
+
+      UNetParams:
+        image_size: 160
+        in_channels: 14 # Tier 4: was 6 (= 7 noisy target + 7 condition, concatenated)
+        model_channels: 128
+        out_channels: 7 # Tier 4: was 3
+        num_res_blocks: 3
+        attention_resolutions: !!python/tuple
+          - 32
+          - 16
+          - 8
+        channel_mult: !!python/tuple
+          - 1
+          - 2
+          - 4
+          - 8
+        conv_resample: True
+        dims: 2
+        num_heads: 8
+        num_head_channels: 64
+        use_scale_shift_norm: True
+        resblock_updown: True
+        use_spatial_transformer: True
+        context_dim: 128
+        condition_key: "hist_context_y_concat" # options {"hist_context_y_concat", "SpatialRescaler", "nocond"}

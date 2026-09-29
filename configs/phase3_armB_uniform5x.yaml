@@ -1,0 +1,127 @@
+# Phase 3 arm B -- uniform deep-gray weighting at 5x, as originally specified.
+# Absolute weights: 1.0 background / 3.0 in-brain / 15.0 deep gray.
+#
+# Fine-tunes from Tier 3 top_model_epoch_472 (current SOTA).
+# n_epochs is ABSOLUTE: BaseRunner sets global_epoch from the checkpoint
+# (BaseRunner.py:171), so 532 = 472 + 60 epochs of fine-tuning.
+runner: "BBDMRunner"
+training:
+  n_epochs: 532
+  n_steps: 10000000
+  save_interval: 1
+  sample_interval: 1
+  validation_interval: 1
+  accumulate_grad_batches: 2
+  grad_clip_max_norm: 1.0
+
+testing:
+  clip_denoised: True
+  sample_num: 1
+
+data:
+  dataset_name: 'fine-tune'
+  dataset_type: 'ct2mr_aligned_global_hist_context_labels'
+  dataset_config:
+    dataset_path: '/blue/neurology-dept/jlabasbas/hdf5s/fine_v2'
+    hist_type:  # 'colin', 'avg'
+    plane: 'axial'
+    image_size: 160
+    channels: 3
+    to_normal: True
+    flip: True
+  train:
+    batch_size: 16
+    shuffle: True
+  val:
+    batch_size: 16
+    shuffle: True
+  test:
+    batch_size: 16
+    shuffle: False
+
+model:
+  model_name: "${date}_${HW}_BBDM_${plane}_DDIM" # part of result path
+  model_type: "BBDM" # LBBDM
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+  # Phase 3: continue from Tier 3 epoch_472 (SSIM 0.774 / masked 0.533, current SOTA).
+  # Load model weights only; fresh optimizer. All three arms share this start point.
+  model_load_path: "/blue/neurology-dept/jlabasbas/new-fine/fine-tune_256/241213_256_BBDM_axial_DDIM_MR_tier3_morphmask/checkpoint/top_model_epoch_472.pth"
+  # optim_sche_load_path: left OFF intentionally — fresh optimizer required
+
+  EMA:
+    use_ema: True
+    ema_decay: 0.995
+    update_ema_interval: 8 # step
+    start_ema_step: 30000
+
+  CondStageParams:
+    n_stages: 2
+    in_channels: 3
+    out_channels: 3
+
+  BB:
+    optimizer:
+      weight_decay: 0.000
+      optimizer: 'Adam'
+      lr: 1.e-6
+      cross_attn_lr: 5.e-6
+      beta1: 0.9
+
+    lr_scheduler:
+      factor: 0.5
+      patience: 3000
+      threshold: 0.0001
+      cooldown: 3000
+      min_lr: 5.e-7
+
+    params:
+      mt_type: 'linear' # options {'linear', 'sin'}
+      objective: 'grad' # options {'grad', 'noise', 'ysubx'}
+      loss_type: 'l1' # options {'l1', 'l2'}
+      lambda_perceptual: 0.05 # weight for VGG perceptual loss (0 to disable)
+      lambda_ssim: 0.1 # weight for differentiable SSIM aux loss (0 to disable)
+      lambda_frequency: 0.1 # weight for focal frequency (anti-blur) loss (0 to disable); calibrate vs logged loss_frequency magnitude
+      lambda_mask_weight: 3.0 # in-brain pixel weight multiplier (1.0 = disabled); applied to all losses
+      mask_threshold: 0.05 # MR intensity threshold in [0,1] units; matches eval foreground_mask thr
+      mask_close_kernel: 9 # morphological closing kernel size (odd int); fills CSF holes in mask. 0 = disabled.
+      lambda_deepgray_weight: 5.0 # deep-gray weight RELATIVE to in-brain tissue (1.0 = disabled)
+      deepgray_mode: 'uniform' # 'uniform' = whole structure, 'shell' = boundary band
+
+      skip_sample: True
+      sample_type: 'linear' # options {"linear", "sin"}
+      sample_step: 200
+
+      num_timesteps: 1000 # timesteps
+      eta: 0.0 # DDIM reverse process eta
+      max_var: 1.0 # maximum variance
+
+      inference_type: 'normal' # options {'normal', 'average', 'ISTA_average', 'ISTA_mid'}
+      num_ISTA_step: 1
+      ISTA_step_size: 2.0
+      
+      UNetParams:
+        image_size: 160
+        in_channels: 6
+        model_channels: 128
+        out_channels: 3
+        num_res_blocks: 3
+        attention_resolutions: !!python/tuple
+          - 32
+          - 16
+          - 8
+        channel_mult: !!python/tuple
+          - 1
+          - 2
+          - 4
+          - 8
+        conv_resample: True
+        dims: 2
+        num_heads: 8
+        num_head_channels: 64
+        use_scale_shift_norm: True
+        resblock_updown: True
+        use_spatial_transformer: True
+        context_dim: 128
+        condition_key: "hist_context_y_concat" # options {"hist_context_y_concat", "SpatialRescaler", "nocond"}

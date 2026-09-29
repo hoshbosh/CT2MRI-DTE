@@ -49,65 +49,17 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-from scipy.ndimage import affine_transform, zoom
+
+from brain_dataset_utils.geometry import derive_geometry, apply_geometry
 from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
-# Resampling
+# Geometry
 # ---------------------------------------------------------------------------
-
-def resample_volume(data, affine, target_spacing=1.0, order=1):
-    """Resample a volume to isotropic voxel spacing."""
-    current_spacing = np.array(nib.affines.voxel_sizes(affine))
-    zoom_factors = current_spacing / target_spacing
-    new_shape = np.round(np.array(data.shape[:3]) * zoom_factors).astype(int)
-
-    resample_matrix = np.diag(1.0 / zoom_factors)
-    resampled = affine_transform(
-        data, matrix=resample_matrix, output_shape=tuple(new_shape),
-        order=order, mode="constant", cval=0.0,
-    )
-
-    new_affine = affine.copy()
-    for i in range(3):
-        new_affine[:3, i] = affine[:3, i] / zoom_factors[i]
-
-    return resampled, new_affine
-
-
-# ---------------------------------------------------------------------------
-# Cropping
-# ---------------------------------------------------------------------------
-
-def crop_to_brain(data, mask, affine, padding=4):
-    """Crop volume and mask to the brain bounding box with padding."""
-    coords = np.argwhere(mask)
-    if len(coords) == 0:
-        return data, mask, affine
-
-    mins = np.maximum(coords.min(axis=0) - padding, 0)
-    maxs = np.minimum(coords.max(axis=0) + 1 + padding, np.array(data.shape[:3]))
-
-    slices = tuple(slice(mn, mx) for mn, mx in zip(mins, maxs))
-    cropped_data = data[slices]
-    cropped_mask = mask[slices]
-
-    new_affine = affine.copy()
-    new_affine[:3, 3] = affine[:3, :3] @ mins + affine[:3, 3]
-
-    return cropped_data, cropped_mask, new_affine
-
-
-# ---------------------------------------------------------------------------
-# Resizing
-# ---------------------------------------------------------------------------
-
-def resize_volume(data, height, width, order=1):
-    """Resize the first two spatial dimensions of a volume to (height, width)."""
-    zoom_factors = (height / data.shape[0], width / data.shape[1], 1.0)
-    return zoom(data, zoom_factors, order=order)
-
+# The reorient / resample / crop / resize chain lives in
+# brain_dataset_utils/geometry.py so that segmentation label maps can be pushed
+# through the identical steps with nearest-neighbour interpolation.
 
 # ---------------------------------------------------------------------------
 # Intensity normalization
@@ -153,51 +105,35 @@ def clip_and_normalize_ct(data, mask, window_center=40, window_width=80):
 def preprocess_subject(args_tuple):
     """Run the full preprocessing pipeline on a single SynthRAD subject."""
     subject_dir, output_dir, target_spacing, padding, clip_percentile, height, width, \
-        ct_name, mr_name, mask_name = args_tuple
+        ct_name, mr_name, mask_name, geometry_only = args_tuple
 
     subject_name = Path(subject_dir).name
     out_subject_dir = os.path.join(output_dir, subject_name)
     os.makedirs(out_subject_dir, exist_ok=True)
 
     # Load CT, MR, and mask
-    ct_img = nib.load(os.path.join(subject_dir, ct_name))
     mr_img = nib.load(os.path.join(subject_dir, mr_name))
     mask_img = nib.load(os.path.join(subject_dir, mask_name))
-
-    ct_data = ct_img.get_fdata().astype(np.float64)
-    mr_data = mr_img.get_fdata().astype(np.float64)
     mask_data = mask_img.get_fdata().astype(bool)
-    affine = mr_img.affine.copy()
+    # Derive the transform chain once from the MR grid, then replay it on every
+    # volume. Labels reuse the same record via geometry.GeometryParams.from_json.
+    params = derive_geometry(mr_img, mask_data, subject_name,
+                             target_spacing=target_spacing, padding=padding,
+                             height=height, width=width)
+    params.to_json(os.path.join(out_subject_dir, "geometry.json"))
 
-    # Reorient to RAS+
-    orig_ornt = nib.io_orientation(affine)
-    ras_ornt = nib.orientations.axcodes2ornt(("R", "A", "S"))
-    transform = nib.orientations.ornt_transform(orig_ornt, ras_ornt)
+    if geometry_only:
+        # Emit only the transform record, leaving existing ct.nii/mr.nii untouched.
+        # Used to backfill geometry.json for a cohort preprocessed before it existed.
+        return subject_name, None, None
 
-    ct_data = nib.orientations.apply_orientation(ct_data, transform)
-    mr_data = nib.orientations.apply_orientation(mr_data, transform)
-    mask_data = nib.orientations.apply_orientation(mask_data, transform)
-    affine = affine @ nib.orientations.inv_ornt_aff(transform, mr_img.shape[:3])
+    ct_data = nib.load(os.path.join(subject_dir, ct_name)).get_fdata().astype(np.float64)
+    mr_data = mr_img.get_fdata().astype(np.float64)
 
-    # Resample to isotropic
-    ct_resampled, new_affine = resample_volume(ct_data, affine, target_spacing, order=1)
-    mr_resampled, _ = resample_volume(mr_data, affine, target_spacing, order=1)
-    mask_resampled, _ = resample_volume(mask_data.astype(np.float64), affine, target_spacing, order=0)
-    mask_resampled = mask_resampled > 0.5
-
-    # Crop to brain bounding box (use mask to define bounds, apply to all)
-    ct_cropped, mask_cropped, crop_affine = crop_to_brain(ct_resampled, mask_resampled, new_affine, padding)
-    # Crop MR with same bounds
-    coords = np.argwhere(mask_resampled)
-    mins = np.maximum(coords.min(axis=0) - padding, 0)
-    maxs = np.minimum(coords.max(axis=0) + 1 + padding, np.array(mr_resampled.shape[:3]))
-    slices = tuple(slice(mn, mx) for mn, mx in zip(mins, maxs))
-    mr_cropped = mr_resampled[slices]
-
-    # Resize to target spatial dimensions
-    ct_cropped = resize_volume(ct_cropped, height, width)
-    mr_cropped = resize_volume(mr_cropped, height, width)
-    mask_cropped = resize_volume(mask_cropped.astype(np.float64), height, width, order=0) > 0.5
+    ct_cropped = apply_geometry(ct_data, params, order=1)
+    mr_cropped = apply_geometry(mr_data, params, order=1)
+    mask_cropped = apply_geometry(mask_data.astype(np.float64), params, order=0) > 0.5
+    crop_affine = np.asarray(params.crop_affine)
 
     # Clip and normalize (CT uses brain window, MR uses percentile)
     ct_normalized = clip_and_normalize_ct(ct_cropped, mask_cropped)
@@ -286,12 +222,14 @@ def main():
                         help="Padding voxels around brain bounding box (default: 4)")
     parser.add_argument("--clip_percentile", type=float, default=99.5,
                         help="Percentile for outlier clipping (default: 99.5)")
-    parser.add_argument("--height", type=int, default=180,
-                        help="Target slice height in pixels (default: 180)")
-    parser.add_argument("--width", type=int, default=180,
-                        help="Target slice width in pixels (default: 180)")
+    parser.add_argument("--height", type=int, default=256,
+                        help="Target slice height in pixels (default: 256)")
+    parser.add_argument("--width", type=int, default=256,
+                        help="Target slice width in pixels (default: 256)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for split (default: 42)")
+    parser.add_argument("--geometry_only", action="store_true",
+                        help="Write geometry.json only; do not touch existing ct.nii/mr.nii")
     parser.add_argument("--workers", type=int, default=None,
                         help="Number of parallel workers (default: number of CPU cores)")
     parser.add_argument("--ct_name", default="ct.nii.gz",
@@ -316,11 +254,15 @@ def main():
     print(f"Target spacing: {args.target_spacing}mm isotropic")
     print(f"Resize: {args.height}x{args.width}")
     print(f"Clip percentile: {args.clip_percentile}")
-    print(f"Output: {args.output_dir}\n")
+    print(f"Output: {args.output_dir}")
+    if args.geometry_only:
+        print("Mode: geometry_only -- writing geometry.json, leaving ct.nii/mr.nii untouched")
+    print()
 
     task_args = [
         (sd, args.output_dir, args.target_spacing, args.padding, args.clip_percentile,
-         args.height, args.width, args.ct_name, args.mr_name, args.mask_name)
+         args.height, args.width, args.ct_name, args.mr_name, args.mask_name,
+         args.geometry_only)
         for sd in subject_dirs
     ]
 

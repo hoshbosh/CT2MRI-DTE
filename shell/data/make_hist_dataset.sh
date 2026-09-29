@@ -1,6 +1,6 @@
 CT_name="ct.nii"
 MR_name="mr.nii"
-HW=180
+HW=256
 for which in "train" "valid" "test"
 do
 	# for plane in "axial" "sagittal" "coronal"
@@ -14,7 +14,7 @@ do
 		    --which_set $which \
 		    --height $HW \
 		    --width $HW \
-		    --pkl_name "/blue/neurology-dept/jlabasbas/pkls/MR_hist_global_${HW}_${which}_${plane}_$hist_typ.pkl" \
+		    --pkl_name "/blue/neurology-dept/jlabasbas/hdf5s/MR_hist_global_${HW}_${which}_${plane}_$hist_typ.pkl" \
 		    --data_dir "/blue/neurology-dept/jlabasbas/out-fine" \
 		    --data_csv "/blue/neurology-dept/jlabasbas/out-fine/data.csv" \
 		    --CT_name $CT_name \

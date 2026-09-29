@@ -6,7 +6,7 @@ training:
   save_interval: 1
   sample_interval: 1
   validation_interval: 3
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2
   use_compile: False 
 
 testing:
@@ -20,18 +20,18 @@ data:
     dataset_path: '/blue/neurology-dept/jlabasbas/hdf5s'
     hist_type:  # 'colin', 'avg'
     plane: 'axial'
-    image_size: 180
+    image_size: 256
     channels: 3
     to_normal: True
     flip: True
   train:
-    batch_size: 16
+    batch_size: 8
     shuffle: True
   val:
-    batch_size: 16
+    batch_size: 8
     shuffle: True
   test:
-    batch_size: 16
+    batch_size: 8
     shuffle: False
 
 model:
@@ -86,18 +86,19 @@ model:
       ISTA_step_size: 2.0
       
       UNetParams:
-        image_size: 160
+        image_size: 256
         in_channels: 6
         model_channels: 128
         out_channels: 3
-        num_res_blocks: 2
-        use_checkpoint: False
+        num_res_blocks: 3
+        use_checkpoint: True
         attention_resolutions: !!python/tuple
           - 32
           - 16
           - 8
         channel_mult: !!python/tuple
           - 1
+          - 2
           - 4
           - 8
         conv_resample: True

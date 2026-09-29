@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:2                   # Run on a single CPU 
 #SBATCH --cpus-per-task=12                    # Run on a single CPU 
 #SBATCH --mem=375gb                     # Job memory request 
-#SBATCH --time=17:00:00               # Time limit hrs:min:sec 
+#SBATCH --time=72:00:00               # Time limit hrs:min:sec 
 #SBATCH --output=ct2mri-train%j.log   # Standard output and error log 
 pwd; hostname; date 
 

@@ -5,6 +5,12 @@ import copy
 import torch
 import random
 import numpy as np
+import sys
+
+# Ensure the repo root (this file's directory) is first on sys.path so the local
+# `datasets`/`utils` packages resolve regardless of the working directory the
+# job is launched from on the cluster.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils import dict2namespace, get_runner, namespace2dict
 import torch.multiprocessing as mp
@@ -31,6 +37,7 @@ def parse_args_and_config():
     parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids, 0,1,2,3 cpu=-1')
     parser.add_argument('--port', type=str, default='12355', help='DDP master port')
     # resume
+    parser.add_argument('--no_auto_resume', action='store_true', default=False, help='ignore any latest_model_*.pth in the run checkpoint dir and start from model_load_path instead')
     parser.add_argument('--resume_model', type=str, default=None, help='model checkpoint')
     parser.add_argument('--resume_optim', type=str, default=None, help='optimizer checkpoint')
 
@@ -41,6 +48,9 @@ def parse_args_and_config():
     parser.add_argument('--max_steps', type=int, default=None, help='optimizer checkpoint')
     # data
     parser.add_argument('--dataset_type', type=str, default='' ,help='dataset type (search register)')
+    parser.add_argument('--dataset_path', type=str, default=None,
+                        help='override data.dataset_config.dataset_path (e.g. to evaluate '
+                             'against a rebuilt HDF5 without editing the checkpoint config)')
     parser.add_argument('--plane', type=str, help='input view: axial, sagittal, coronal')
     parser.add_argument('--HW', type=int, default=128, help='HW of input image')
     parser.add_argument('--batch', type=int, default=8, help='batch size')
@@ -55,6 +65,7 @@ def parse_args_and_config():
     parser.add_argument('--inference_type', type=str, default=None, help='inference_type: normal, average, ISTA_average, ISTA_mid')
     parser.add_argument('--ISTA_step_size', type=float, default=None, help='ISTA_step_size')
     parser.add_argument('--num_ISTA_step', type=int, default=None, help='num_ISTA_step')
+    parser.add_argument('--uq_samples', type=int, default=1, help='stochastic samples per subject for uncertainty estimation (1 = off); needs --ddim_eta > 0')
     
     args = parser.parse_args()
 
@@ -100,10 +111,14 @@ def parse_args_and_config():
         namespace_config.model.BB.params.ISTA_step_size = args.ISTA_step_size
     if args.num_ISTA_step is not None:
         namespace_config.model.BB.params.num_ISTA_step = args.num_ISTA_step
+    namespace_config.model.BB.params.uq_samples = args.uq_samples
         
     if args.sample_to_eval:
         if args.dataset_type != '':
             namespace_config.data.dataset_type = args.dataset_type
+
+    if args.dataset_path is not None:
+        namespace_config.data.dataset_config.dataset_path = args.dataset_path
 
     dict_config = namespace2dict(namespace_config)
     

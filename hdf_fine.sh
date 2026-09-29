@@ -18,6 +18,6 @@ module load freesurfer
 
 conda activate ct2mri
 
-./shell/data/make_hdf5.sh
+./shell/data/make_fine_hdf.sh
 
 date

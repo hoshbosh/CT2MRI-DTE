@@ -9,8 +9,8 @@ do
     python -u brain_dataset_utils/generate_total_hdf5_csv.py \
             --plane  $plane\
             --which_set $which \
-            --height 180 \
-            --width 180 \
+            --height 256 \
+            --width 256 \
             --hdf5_name "/blue/neurology-dept/jlabasbas/hdf5s/180_${which}_${plane}.hdf5" \
             --data_dir "/blue/neurology-dept/jlabasbas/out" \
             --data_csv "/blue/neurology-dept/jlabasbas/out/data.csv" \

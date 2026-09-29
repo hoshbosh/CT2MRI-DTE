@@ -8,8 +8,36 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from model.utils import extract, default
+from model.losses import PerceptualLoss, SSIMLoss, FrequencyLoss
 from model.BrownianBridge.base.modules.diffusionmodules.openaimodel import UNetModel
 from model.BrownianBridge.bbdm_utils import file_path
+
+
+def deepgray_mask_from_labels(labels, mode, dilate=2, erode=1):
+    """Binary deep-gray weight mask from an integer structure label map.
+
+    labels: (B, 1, H, W) integer tensor; any non-zero code is deep gray.
+    mode:   'uniform' -> the whole structure
+            'shell'   -> a band around its boundary, dilate(d) minus erode(e),
+                         which is where the Phase 2 boundary report located the
+                         error. The band straddles the boundary: it reaches d px
+                         outward into neighbouring tissue and e px inward.
+
+    Returns a float mask in [0, 1] with the same shape as `labels`.
+    """
+    if labels.dim() != 4 or labels.shape[1] != 1:
+        raise ValueError(f"expected (B, 1, H, W) label map, got {tuple(labels.shape)}")
+    dg = (labels > 0).float()
+    if mode == 'uniform':
+        return dg
+    if mode == 'shell':
+        if dilate < 0 or erode < 0:
+            raise ValueError(f"shell radii must be non-negative; got {dilate}, {erode}")
+        outer = F.max_pool2d(dg, 2 * dilate + 1, stride=1, padding=dilate)
+        inner = -F.max_pool2d(-dg, 2 * erode + 1, stride=1, padding=erode)
+        return (outer - inner).clamp_(0.0, 1.0)
+    raise ValueError(f"deepgray_mode must be 'uniform' or 'shell'; got {mode!r}")
+
 
 class BrownianBridgeModel(nn.Module):
     def __init__(self, model_config):
@@ -37,6 +65,66 @@ class BrownianBridgeModel(nn.Module):
         self.condition_key = model_params.UNetParams.condition_key
 
         self.denoise_fn = UNetModel(**vars(model_params.UNetParams))
+
+        # SKC bypass diagnostic: disable cross-attention if configured
+        if getattr(model_params, 'disable_cross_attention', False):
+            self.denoise_fn.set_cross_attention_enabled(False)
+            print("WARNING: Cross-attention disabled (SKC bypass diagnostic mode)")
+
+        # Perceptual loss (frozen VGG-16)
+        self.lambda_perceptual = getattr(model_params, 'lambda_perceptual', 0.0)
+        if self.lambda_perceptual > 0:
+            self.perceptual_loss_fn = PerceptualLoss()
+            print(f"Perceptual loss enabled with lambda={self.lambda_perceptual}")
+
+        # SSIM auxiliary loss (differentiable structural similarity)
+        self.lambda_ssim = getattr(model_params, 'lambda_ssim', 0.0)
+        if self.lambda_ssim > 0:
+            self.ssim_loss_fn = SSIMLoss()
+            print(f"SSIM loss enabled with lambda={self.lambda_ssim}")
+
+        # Focal frequency loss (anti-blur: restores high-frequency detail)
+        self.lambda_frequency = getattr(model_params, 'lambda_frequency', 0.0)
+        if self.lambda_frequency > 0:
+            self.frequency_loss_fn = FrequencyLoss()
+            print(f"Frequency loss enabled with lambda={self.lambda_frequency}")
+
+        # Brain mask spatial weighting: in-brain pixels get lambda_mask_weight × more loss.
+        # Mask uses center channel of x0 + morphological closing to fill CSF holes.
+        self.lambda_mask_weight = getattr(model_params, 'lambda_mask_weight', 1.0)
+        # Interpreted in [0, 1] intensity units (see p_losses), so it matches
+        # the threshold runners/eval.py uses for the reported masked metrics.
+        self.mask_threshold = getattr(model_params, 'mask_threshold', 0.05)
+        # mask_close_kernel: odd int; closing fills ventricle/CSF holes. 0 = disabled.
+        self.mask_close_kernel = getattr(model_params, 'mask_close_kernel', 0)
+        if self.lambda_mask_weight > 1.0:
+            print(f"Brain mask loss enabled: in-brain weight={self.lambda_mask_weight}, "
+                  f"threshold={self.mask_threshold} (in [0,1] intensity units, matching "
+                  f"eval's foreground_mask), close_kernel={self.mask_close_kernel}")
+
+        # Deep-gray structure weighting (Phase 3). Composes multiplicatively on top
+        # of the brain-mask weight, so this reads as "N x more than other in-brain
+        # tissue" rather than an absolute number. Default 1.0 keeps every existing
+        # config byte-identical in behaviour.
+        self.lambda_deepgray_weight = getattr(model_params, 'lambda_deepgray_weight', 1.0)
+        # 'uniform' weights the whole structure; 'shell' weights only a band around
+        # its boundary (dilate minus erode), which is where the Phase 2 boundary
+        # report located the error.
+        self.deepgray_mode = getattr(model_params, 'deepgray_mode', 'uniform')
+        self.deepgray_shell_dilate = getattr(model_params, 'deepgray_shell_dilate', 2)
+        self.deepgray_shell_erode = getattr(model_params, 'deepgray_shell_erode', 1)
+        if self.lambda_deepgray_weight > 1.0:
+            if self.deepgray_mode not in ('uniform', 'shell'):
+                raise ValueError(
+                    f"deepgray_mode must be 'uniform' or 'shell'; got {self.deepgray_mode!r}"
+                )
+            eff = self.lambda_deepgray_weight * max(self.lambda_mask_weight, 1.0)
+            print(f"Deep-gray loss weighting enabled: mode={self.deepgray_mode}, "
+                  f"weight={self.lambda_deepgray_weight} relative to in-brain tissue "
+                  f"(effective absolute weight {eff:g} vs 1.0 background)")
+            if self.deepgray_mode == 'shell':
+                print(f"  shell = dilate({self.deepgray_shell_dilate}) - "
+                      f"erode({self.deepgray_shell_erode}) px")
 
     def register_schedule(self):
         T = self.num_timesteps
@@ -88,6 +176,16 @@ class BrownianBridgeModel(nn.Module):
     def get_parameters(self):
         return self.denoise_fn.parameters()
 
+    def get_parameter_groups(self, base_lr, cross_attn_lr):
+        """Return parameter groups with separate LR for cross-attention layers."""
+        cross_attn_params = self.denoise_fn.get_cross_attention_params()
+        cross_attn_param_ids = {id(p) for p in cross_attn_params}
+        base_params = [p for p in self.denoise_fn.parameters() if id(p) not in cross_attn_param_ids]
+        return [
+            {'params': base_params, 'lr': base_lr},
+            {'params': cross_attn_params, 'lr': cross_attn_lr},
+        ]
+
     def input_condition_config(self, x, y, context):
         if self.condition_key == "nocond":
             context = None
@@ -101,15 +199,15 @@ class BrownianBridgeModel(nn.Module):
             context = y if context is None else context
         return x, y, context
 
-    def forward(self, x, y, context=None):
+    def forward(self, x, y, context=None, labels=None):
         x, y, context = self.input_condition_config(x, y, context)
 
         b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(x, y, context, t)
+        return self.p_losses(x, y, context, t, labels=labels)
 
-    def p_losses(self, x0, y, context, t, noise=None):
+    def p_losses(self, x0, y, context, t, noise=None, labels=None):
         """
         model loss
         :param x0: encoded x_ori, E(x_ori) = x0
@@ -125,19 +223,134 @@ class BrownianBridgeModel(nn.Module):
         x_t, objective = self.q_sample(x0, y, t, noise)
         objective_recon = self.denoise_fn(x_t, timesteps=t, context=context)
 
+        # On-the-fly brain mask from MR target center channel.
+        # Center channel is the actual target slice; neighboring channels are padding.
+        # Morphological closing fills CSF holes (ventricles, sulci) that a bare
+        # threshold marks as background, so the loss covers full brain interior.
+        if self.lambda_mask_weight > 1.0:
+            mid = x0.shape[1] // 2
+            # x0 is in [-1, 1]; mask_threshold is specified in [0, 1] intensity
+            # units so it means the same thing here as it does in
+            # runners/eval.py:foreground_mask. Thresholding x0 directly (as this
+            # did before) compared a [0,1]-scaled number against [-1,1] data,
+            # making the training mask far more restrictive than the reported one.
+            x0_unit = x0[:, mid:mid+1] * 0.5 + 0.5
+            coarse = (x0_unit > self.mask_threshold).float()
+            if self.mask_close_kernel > 0:
+                k, p = self.mask_close_kernel, self.mask_close_kernel // 2
+                dilated = F.max_pool2d(coarse, k, stride=1, padding=p)
+                coarse = -F.max_pool2d(-dilated, k, stride=1, padding=p)
+            brain_mask = coarse.expand(-1, x0.shape[1], -1, -1).contiguous()
+            loss_weight = 1.0 + (self.lambda_mask_weight - 1.0) * brain_mask
+        else:
+            brain_mask = None
+            loss_weight = None
+
+        # Deep-gray structure weighting. Multiplies into loss_weight, so with
+        # lambda_mask_weight=3 and lambda_deepgray_weight=5 the absolute weights
+        # are 1.0 background / 3.0 in-brain / 15.0 deep gray.
+        deepgray_frac = None
+        if self.lambda_deepgray_weight > 1.0:
+            if labels is None:
+                raise ValueError(
+                    "lambda_deepgray_weight > 1.0 but no label map reached p_losses. "
+                    "Set data.dataset_type to 'ct2mr_aligned_global_hist_context_labels', "
+                    "or set lambda_deepgray_weight to 1.0 to disable the term."
+                )
+            if labels.shape[1] != 1:
+                raise ValueError(
+                    f"expected a single-channel label map, got {tuple(labels.shape)}"
+                )
+            if labels.shape[-2:] != x0.shape[-2:]:
+                raise ValueError(
+                    f"label map {tuple(labels.shape[-2:])} does not match image "
+                    f"{tuple(x0.shape[-2:])}; labels were built on a different grid"
+                )
+            dg = deepgray_mask_from_labels(
+                labels, self.deepgray_mode,
+                self.deepgray_shell_dilate, self.deepgray_shell_erode,
+            )
+            dg = dg.expand(-1, x0.shape[1], -1, -1).contiguous()
+            dg_weight = 1.0 + (self.lambda_deepgray_weight - 1.0) * dg
+            loss_weight = dg_weight if loss_weight is None else loss_weight * dg_weight
+            # Logged so a silently-empty label batch is visible rather than
+            # showing up as "the loss did nothing".
+            deepgray_frac = dg.mean().detach()
+
         if self.loss_type == 'l1':
-            recloss = (objective - objective_recon).abs().mean()
+            if loss_weight is not None:
+                recloss = ((objective - objective_recon).abs() * loss_weight).mean()
+            else:
+                recloss = (objective - objective_recon).abs().mean()
         elif self.loss_type == 'l2':
-            recloss = F.mse_loss(objective, objective_recon)
+            if loss_weight is not None:
+                recloss = (F.mse_loss(objective, objective_recon, reduction='none') * loss_weight).mean()
+            else:
+                recloss = F.mse_loss(objective, objective_recon)
         else:
             raise NotImplementedError()
 
-        x0_recon = self.predict_x0_from_objective(x_t, y, t, objective_recon)
+        # x0_recon division by (1 - m_t) at high t can overflow in fp16. Compute
+        # the reconstruction in fp32 so aux losses see a finite target.
+        with torch.amp.autocast('cuda', enabled=False):
+            x0_recon = self.predict_x0_from_objective(
+                x_t.float(), y.float(), t, objective_recon.float()
+            )
+
+        total_loss = recloss
         log_dict = {
             "loss": recloss,
-            "x0_recon": x0_recon
+            "recloss_l1": recloss,
+            "x0_recon": x0_recon,
         }
-        return recloss, log_dict
+
+        # Auxiliary losses on x0_recon. Gate to small t because x0_recon at
+        # high t is a noisy single-step estimate and gradients from it bias
+        # the network toward smooth means.
+        t_mask = t < (self.num_timesteps // 4)
+
+        # Both aux losses are numerically fragile under AMP:
+        #  - SSIM constants C1=1e-4, C2=9e-4 sit at the edge of fp16 precision
+        #    and the variance terms can underflow to 0, blowing up the ratio.
+        #  - VGG feature magnitudes can overflow fp16.
+        # Run them in fp32 and drop the term if it still goes non-finite so
+        # GradScaler doesn't see Inf/NaN and skip the optimizer step.
+        # When brain mask is active, zero out background on both sides so aux
+        # losses focus entirely on brain-interior content.
+        def _safe_add(name, loss_fn, weight):
+            nonlocal total_loss
+            with torch.amp.autocast('cuda', enabled=False):
+                x0_r = x0_recon[t_mask].float()
+                x0_t = x0[t_mask].float()
+                if brain_mask is not None:
+                    m = brain_mask[t_mask].float()
+                    x0_r = x0_r * m
+                    x0_t = x0_t * m
+                term = loss_fn(x0_r, x0_t)
+            if not torch.isfinite(term):
+                # Rate-limit: only print on the first occurrence per process.
+                if not getattr(self, f'_warned_{name}', False):
+                    print(f"WARNING: {name} produced non-finite value; dropping this batch's contribution")
+                    setattr(self, f'_warned_{name}', True)
+                log_dict[name] = torch.tensor(0.0, device=term.device)
+                return
+            total_loss = total_loss + weight * term
+            log_dict[name] = term
+
+        if self.lambda_perceptual > 0 and t_mask.any():
+            _safe_add("perceptual_loss", self.perceptual_loss_fn, self.lambda_perceptual)
+
+        if self.lambda_ssim > 0 and t_mask.any():
+            _safe_add("ssim_loss", self.ssim_loss_fn, self.lambda_ssim)
+
+        if self.lambda_frequency > 0 and t_mask.any():
+            _safe_add("frequency_loss", self.frequency_loss_fn, self.lambda_frequency)
+
+        if deepgray_frac is not None:
+            log_dict["deepgray_frac"] = deepgray_frac
+
+        log_dict["loss"] = total_loss
+        return total_loss, log_dict
 
     def q_sample(self, x0, y, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x0))

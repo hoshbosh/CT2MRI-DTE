@@ -1,12 +1,13 @@
 # Brownian Bridge Diffusion Model Template(Pixel Space)
 runner: "BBDMRunner"
 training:
-  n_epochs: 120
+  n_epochs: 551
   n_steps: 10000000
   save_interval: 1
   sample_interval: 1
   validation_interval: 1
   accumulate_grad_batches: 2
+  grad_clip_max_norm: 1.0
 
 testing:
   clip_denoised: True
@@ -16,7 +17,7 @@ data:
   dataset_name: 'fine-tune'
   dataset_type: 'ct2mr_aligned_global_hist_context'
   dataset_config:
-    dataset_path: '/blue/neurology-dept/jlabasbas/hdf5s'
+    dataset_path: '/blue/neurology-dept/jlabasbas/hdf5s/fine'
     hist_type:  # 'colin', 'avg'
     plane: 'axial'
     image_size: 160
@@ -39,8 +40,10 @@ model:
   latent_before_quant_conv: False
   normalize_latent: False
   only_load_latent_mean_std: False
-  # model_load_path:  # model checkpoint path
-  # optim_sche_load_path:  # optimizer scheduler checkpoint path
+  # Tier 3: continue from tier2_ssim epoch_412 (SSIM_mask=0.50, evaluated job 38180847).
+  # Load model weights only; fresh optimizer resets LR to 1.e-6 (Tier 2 LR decayed to ~0).
+  model_load_path: "/blue/neurology-dept/jlabasbas/new-fine/fine-tune_256/241213_256_BBDM_axial_DDIM_MR_tier2_ssim/checkpoint/top_model_epoch_412.pth"
+  # optim_sche_load_path: left OFF intentionally — fresh optimizer required
 
   EMA:
     use_ema: True
@@ -57,7 +60,8 @@ model:
     optimizer:
       weight_decay: 0.000
       optimizer: 'Adam'
-      lr: 5.e-6
+      lr: 1.e-6
+      cross_attn_lr: 5.e-6
       beta1: 0.9
 
     lr_scheduler:
@@ -71,6 +75,12 @@ model:
       mt_type: 'linear' # options {'linear', 'sin'}
       objective: 'grad' # options {'grad', 'noise', 'ysubx'}
       loss_type: 'l1' # options {'l1', 'l2'}
+      lambda_perceptual: 0.05 # weight for VGG perceptual loss (0 to disable)
+      lambda_ssim: 0.1 # weight for differentiable SSIM aux loss (0 to disable)
+      lambda_frequency: 0.1 # weight for focal frequency (anti-blur) loss (0 to disable); calibrate vs logged loss_frequency magnitude
+      lambda_mask_weight: 3.0 # in-brain pixel weight multiplier (1.0 = disabled); applied to all losses
+      mask_threshold: 0.05 # MR intensity threshold in [0,1] units; matches eval foreground_mask thr
+      mask_close_kernel: 9 # morphological closing kernel size (odd int); fills CSF holes in mask. 0 = disabled.
 
       skip_sample: True
       sample_type: 'linear' # options {"linear", "sin"}
@@ -78,7 +88,7 @@ model:
 
       num_timesteps: 1000 # timesteps
       eta: 0.0 # DDIM reverse process eta
-      max_var: 0.5 # maximum variance
+      max_var: 1.0 # maximum variance
 
       inference_type: 'normal' # options {'normal', 'average', 'ISTA_average', 'ISTA_mid'}
       num_ISTA_step: 1
@@ -89,13 +99,14 @@ model:
         in_channels: 6
         model_channels: 128
         out_channels: 3
-        num_res_blocks: 2
+        num_res_blocks: 3
         attention_resolutions: !!python/tuple
           - 32
           - 16
           - 8
         channel_mult: !!python/tuple
           - 1
+          - 2
           - 4
           - 8
         conv_resample: True
